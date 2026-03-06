@@ -1,0 +1,83 @@
+Vulnerability: Broken Integer Overflow Check Leading to Heap Information Disclosure in decode_text_to_exif()
+
+Location: libavcodec/pngdec.c, line 561
+
+Severity: High (CWE-190: Integer Overflow, CWE-908: Use of Uninitialized Resource)
+
+Description:
+The function decode_text_to_exif() contains a broken integer overflow check that is
+intended to prevent integer overflow when computing 2 * exif_len, but the check is
+always false, making it a no-op:
+
+    // line 561
+    if ((exif_len & ~SIZE_MAX) || end - ptr < 2 * exif_len)
+        return AVERROR_INVALIDDATA;
+
+The expression (exif_len & ~SIZE_MAX) is always 0 because:
+- exif_len is declared as size_t (line 523)
+- SIZE_MAX is the maximum value of size_t, i.e., (size_t)-1
+- ~SIZE_MAX is therefore (size_t)0
+- Any value ANDed with 0 is 0
+
+The developer likely intended something like:
+    if (exif_len > SIZE_MAX / 2 || end - ptr < 2 * exif_len)
+
+Because this overflow guard is non-functional, an attacker can craft a PNG tEXt chunk
+with keyword "Raw profile type exif" containing a malicious exif_len value that causes
+2 * exif_len to silently wrap around to a small value (integer overflow). This bypasses
+the bounds check (end - ptr < 2 * exif_len), since the overflowed result is small
+enough to pass.
+
+Exploitation Path:
+1. Attacker crafts a PNG file with a tEXt chunk, keyword "Raw profile type exif"
+2. The text body contains a crafted decimal length value that:
+   - Passes the per-digit overflow check at line 547 (which only detects some overflows)
+   - Is >= 10 (passes the check at line 563)
+   - Causes 2 * exif_len to overflow to a small value (e.g., on 32-bit: exif_len =
+     0x80000008 causes 2 * exif_len to wrap to 0x10 = 16)
+3. The bounds check on line 561 passes because 2 * exif_len overflowed to a small value
+4. av_buffer_alloc(exif_len - 6) allocates a buffer at line 570. On systems with memory
+   overcommit (common Linux default), this large allocation may succeed.
+5. The hex parsing loop (lines 581-605) attempts to fill exif_len - 6 bytes of the
+   buffer, but runs out of input data almost immediately (only ~16 bytes available vs
+   ~2GB needed).
+6. The inner parsing loops (lines 582-601) check ptr < end and exit when input is
+   exhausted, leaving the vast majority of the allocated buffer uninitialized.
+7. The error check at line 602 (ptr > end) has an off-by-one: it should be ptr >= end.
+   When ptr == end after the second inner loop, the check does NOT trigger, causing one
+   additional iteration where *exif_ptr is written with only a partial nibble or left
+   completely uninitialized.
+
+Impact:
+- On 32-bit platforms with memory overcommit: The allocated exif buffer contains
+  uninitialized heap data. If the function returns success (or if error handling is
+  incomplete), this data is attached to the decoded frame as EXIF metadata, leaking
+  heap contents (information disclosure).
+- The broken overflow check represents a fundamental security control failure. Any
+  future code changes that alter the allocation strategy or error handling could
+  escalate this to a heap buffer overflow.
+- Even on 64-bit platforms where the allocation fails, the broken check demonstrates
+  missing protection that should prevent any overflow-based bypass of bounds checking.
+
+Additional Issue - Off-by-one in error check (line 602):
+    if (ptr > end)
+        return AVERROR_INVALIDDATA;
+
+This should be (ptr >= end) because the inner while loops can leave ptr == end without
+finding hex digits, causing the outer loop to continue with an incompletely written byte.
+The current check misses this boundary condition.
+
+Affected code path:
+decode_frame_png() -> decode_frame_common() -> decode_text_chunk() [with keyword
+"Raw profile type exif"] -> decode_text_to_exif()
+
+Fix:
+Replace line 561:
+    if ((exif_len & ~SIZE_MAX) || end - ptr < 2 * exif_len)
+With:
+    if (exif_len > SIZE_MAX / 2 || end - ptr < 2 * exif_len)
+
+And replace line 602:
+    if (ptr > end)
+With:
+    if (ptr >= end)

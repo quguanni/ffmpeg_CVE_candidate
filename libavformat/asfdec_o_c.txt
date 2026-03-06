@@ -1,0 +1,46 @@
+Vulnerability: Off-by-one Out-of-Bounds Read / NULL Pointer Dereference in asf_read_payload()
+
+File: libavformat/asfdec_o.c
+Function: asf_read_payload()
+Line: 1226
+
+Severity: High (Denial of Service via crash; potential code execution depending on heap layout)
+
+Description:
+In the `asf_read_payload()` function, when processing subpayloads (the `else` branch at line 1225, entered when `asf->sub_left` is non-zero), the loop that searches for a matching stream uses an incorrect bound:
+
+    } else {
+        for (i = 0; i <= asf->nb_streams; i++) {   // BUG: should be <, not <=
+            if (asf->stream_index == asf->asf_st[i]->stream_index) {
+
+The loop condition uses `<=` instead of `<`. Valid stream indices in the `asf->asf_st[]` array are 0 through `asf->nb_streams - 1`. When `i == asf->nb_streams`, the code accesses `asf->asf_st[asf->nb_streams]`, which is beyond the initialized entries.
+
+The `asf_st` array is declared as:
+    ASFStream *asf_st[ASF_MAX_STREAMS];  // ASF_MAX_STREAMS = 128
+
+Since `priv_data` is zero-initialized by the demuxer framework, `asf->asf_st[nb_streams]` will be NULL when `nb_streams < ASF_MAX_STREAMS`. Dereferencing it (`->stream_index`) causes a NULL pointer dereference and crash.
+
+When `nb_streams == ASF_MAX_STREAMS` (128), the access `asf->asf_st[128]` reads beyond the array bounds entirely, accessing whatever memory follows in the ASFContext struct (the `asf_sd` array), interpreting it as an `ASFStream*` pointer. This could lead to:
+  - Crash from dereferencing an invalid pointer
+  - Information disclosure from reading unintended memory
+  - Potential arbitrary code execution if the attacker can control the adjacent memory contents
+
+Triggering Condition:
+An attacker crafts an ASF file with:
+1. At least one valid stream (so nb_streams >= 1)
+2. A packet with subpayloads (rep_data_len == 1) that sets sub_left = 1
+3. A subsequent payload in the same packet whose stream_index does not match any valid stream
+
+When the code re-enters asf_read_payload with sub_left != 0, it takes the `else` branch and iterates with the off-by-one bound, accessing the out-of-bounds pointer.
+
+Contrast with the correct loop at line 1177 (in the `if (!asf->sub_left)` branch):
+    for (i = 0; i < asf->nb_streams; i++) {   // Correct: uses <
+
+The fix is to change `<=` to `<` on line 1226:
+    for (i = 0; i < asf->nb_streams; i++) {
+
+Additionally, after the loop (line 1236), if the loop completes without finding a match, `asf->asf_st[i]->index` is accessed where `i == nb_streams`, which is also out-of-bounds:
+    pkt->stream_index  = asf->asf_st[i]->index;  // line 1236, OOB if no match found
+
+Root Cause: Off-by-one error in loop termination condition.
+CWE: CWE-125 (Out-of-bounds Read), CWE-476 (NULL Pointer Dereference)

@@ -1,0 +1,91 @@
+CVE Candidate: Heap Buffer Over-Read in parse_speex_extradata() via Unchecked "Speex   " Marker Offset
+
+Severity: HIGH (CVSS ~7.5 - Network/Low complexity/No privileges/No interaction)
+CWE: CWE-125 (Out-of-bounds Read), CWE-126 (Buffer Over-read)
+Affected File: libavcodec/speexdec.c
+Affected Function: parse_speex_extradata()
+
+=== VULNERABILITY DESCRIPTION ===
+
+In parse_speex_extradata() (speexdec.c:1401-1441), the function uses
+av_strnstr() to search for the "Speex   " marker anywhere within the
+extradata buffer, then reads header fields at fixed offsets from the found
+position without verifying that those offsets remain within the buffer:
+
+    const uint8_t *buf = av_strnstr(extradata, "Speex   ", extradata_size);
+    if (!buf)
+        return AVERROR_INVALIDDATA;
+    buf += 28;                                   // line 1410 - unchecked advance
+    s->version_id = bytestream_get_le32(&buf);   // line 1412 - potential OOB
+    buf += 4;                                    // line 1413
+    s->rate = bytestream_get_le32(&buf);         // line 1414 - potential OOB
+    ...continues reading up to 72 bytes past marker position...
+
+The caller at line 1452 only checks that extradata_size >= 80:
+
+    if (avctx->extradata && avctx->extradata_size >= 80) {
+        ret = parse_speex_extradata(avctx, avctx->extradata, avctx->extradata_size);
+
+This check assumes "Speex   " is at offset 0. However, av_strnstr() can find
+the 8-byte marker at any position from 0 to (extradata_size - 8). The function
+then reads header fields spanning 72 bytes from the marker position (offset 28
+through offset 71 from the marker, via successive bytestream_get_le32 calls).
+
+When "Speex   " is found at offset P within extradata, reads extend to
+extradata[P + 71]. For extradata_size = 80:
+  - P = 0: reads up to extradata[71], within bounds.
+  - P = 9: reads up to extradata[80], 1 byte OOB.
+  - P = 72 (maximum possible): reads up to extradata[143], 64 bytes OOB.
+
+The bytestream_get_le32() calls perform raw memory reads with no bounds
+checking, directly accessing heap memory beyond the allocated extradata buffer.
+
+=== IMPACT ===
+
+1. Information Disclosure: The OOB reads return heap data that is then stored
+   in SpeexContext fields (version_id, rate, mode, bitstream_version,
+   nb_channels, bitrate, frame_size, vbr, frames_per_packet, extra_headers).
+   While most values are subsequently validated, the raw heap contents are
+   processed and can influence decoder behavior.
+
+2. Crash / Denial of Service: If the OOB read crosses a page boundary into
+   unmapped memory, it causes a segmentation fault (SIGSEGV), crashing any
+   application using FFmpeg's Speex decoder.
+
+3. Network Exploitable: Malicious Speex audio embedded in Ogg or WebM
+   containers can be served via web, media streaming, or messaging. Any
+   application that processes the file (ffmpeg, ffprobe, ffplay, VLC, web
+   browsers, media players) will trigger the vulnerability.
+
+4. Heap Layout Oracle: By observing which crafted inputs cause crashes vs.
+   successful parsing, an attacker can infer heap layout information, aiding
+   in further exploitation (ASLR bypass, etc.).
+
+=== ROOT CAUSE ===
+
+The use of av_strnstr() introduces a variable offset for the "Speex   " marker,
+but all subsequent parsing assumes the marker is at offset 0 (or at least that
+72 bytes remain after it). The extradata_size >= 80 check is insufficient
+because it does not account for the marker's position within the buffer.
+
+The original Speex header specification places the marker at offset 0, but
+av_strnstr is used presumably for robustness. This robustness measure
+introduces the OOB read when combined with the lack of remaining-size
+validation.
+
+=== SUGGESTED FIX ===
+
+Add a bounds check after finding the marker to ensure sufficient data remains:
+
+    const uint8_t *buf = av_strnstr(extradata, "Speex   ", extradata_size);
+    if (!buf)
+        return AVERROR_INVALIDDATA;
++   if (extradata + extradata_size - buf < 80) {
++       av_log(avctx, AV_LOG_ERROR, "Truncated Speex header\n");
++       return AVERROR_INVALIDDATA;
++   }
+    buf += 28;
+
+This ensures at least 80 bytes are available from the marker position,
+covering all subsequent reads (the farthest read is extra_headers at
+offset 72-75 from the marker, well within 80 bytes).

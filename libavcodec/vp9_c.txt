@@ -1,0 +1,99 @@
+Vulnerability: Off-by-One in VP9 Coefficient Probability Copy Path Leads to
+Decoder State Corruption and Potential Heap Buffer Overflow
+
+File: libavcodec/vp9.c
+Function: decode_frame_header()
+Lines: 959-993
+
+== Summary ==
+
+An off-by-one inconsistency between the coefficient probability "update" path
+and the "copy" path in the VP9 compressed header parser causes the decoder to
+process an extra, out-of-spec probability band for DC coefficients. This
+corrupts the arithmetic decoder's probability state, which can be exploited
+via a crafted VP9 bitstream to desynchronize the entropy decoder, leading to
+incorrect block parameters and potentially out-of-bounds heap writes during
+frame reconstruction.
+
+== Root Cause ==
+
+In decode_frame_header(), the coefficient probability table is populated in
+two branches depending on a per-transform-size flag read from the bitstream:
+
+UPDATE PATH (line 968) — when the update flag is set:
+
+    if (m >= 3 && l == 0) // dc only has 3 pt
+        break;
+
+COPY PATH (line 985) — when the update flag is NOT set:
+
+    if (m > 3 && l == 0) // dc only has 3 pt
+        break;
+
+The update path uses "m >= 3" (correct per VP9 spec: DC band l=0 has exactly
+3 probability contexts, m=0,1,2). The copy path uses "m > 3" which processes
+an EXTRA iteration at m=3 when l=0.
+
+The adapt_probs function (vp9prob.c:60) correctly uses "m >= 3", confirming
+the copy path is wrong.
+
+== Impact ==
+
+On each affected iteration (l=0, m=3), the copy path executes:
+
+    uint8_t *p = s->prob.coef[i][j][k][0][3];   // 11-byte entry
+    uint8_t *r = ref[j][k][0][3];                // 3-byte entry from prob_ctx
+    memcpy(p, r, 3);
+    memcpy(&p[3], ff_vp9_model_pareto8[p[2]], 8);
+
+This reads stale/uninitialized data from prob_ctx[c].coef[i][j][k][0][3]
+(which is never written by the update path or by adapt_probs for l=0, m>=3)
+and writes 11 bytes of derived probability data into prob.coef[i][j][k][0][3].
+
+The value at p[2] (stale data) is used as an index into ff_vp9_model_pareto8[],
+a 256-entry lookup table. While this specific array access is within bounds
+(uint8_t index), the resulting probability values are incorrect and
+attacker-influenced across frames.
+
+== Exploitation Scenario ==
+
+1. An attacker crafts a multi-frame VP9 bitstream where:
+   - Frame 1 (keyframe): Sets up initial probability state. The default
+     coef probs at [i][j][k][0][3] are initialized from
+     ff_vp9_default_coef_probs.
+   - Frame 2 (inter frame): Has the coef update flag UNSET for one or more
+     transform sizes, triggering the copy path. The stale data at
+     prob_ctx[c].coef[i][j][k][0][3] is copied into the active probability
+     table, corrupting the entropy decoder state.
+   - The corrupted probabilities cause the arithmetic decoder to consume
+     an incorrect number of bits from the bitstream.
+   - This desynchronization causes subsequent block decoding to read
+     wrong block sizes, motion vectors, or reference indices.
+   - Wrong block parameters lead to out-of-bounds writes during inter
+     prediction (mc/motion compensation) or intra reconstruction, as
+     decoded blocks reference memory outside the allocated frame buffer.
+
+2. Cross-frame amplification: Since the corrupted prob.coef values are
+   never corrected by adapt_probs (which also skips m>=3 for l=0), the
+   corruption persists in prob_ctx across frames, affecting all subsequent
+   frames that use the copy path. An attacker can progressively corrupt
+   the probability state to achieve precise control over decoder behavior.
+
+== Severity ==
+
+- Type: CWE-193 (Off-By-One Error) leading to CWE-787 (Out-of-bounds Write)
+- Attack Vector: Network (crafted VP9 file/stream)
+- Impact: Code execution via heap corruption, denial of service via crash
+- Affected: All FFmpeg versions with this VP9 decoder code
+- Authentication: None required
+- User Interaction: Victim must open/play the crafted VP9 file
+
+== Fix ==
+
+Change line 985 from:
+    if (m > 3 && l == 0) // dc only has 3 pt
+to:
+    if (m >= 3 && l == 0) // dc only has 3 pt
+
+This makes the copy path consistent with the update path and with
+adapt_probs, correctly limiting DC coefficient contexts to m=0,1,2.

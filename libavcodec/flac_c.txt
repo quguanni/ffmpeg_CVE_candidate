@@ -1,0 +1,82 @@
+CVE Candidate: Missing Sample Rate Validation in ff_flac_parse_streaminfo() leads to Division-by-Zero (DoS)
+
+Severity: HIGH (CVSS ~7.5 - Network/Low complexity/No privileges/No interaction)
+CWE: CWE-369 (Divide By Zero), CWE-20 (Improper Input Validation)
+Affected File: libavcodec/flac.c
+Affected Functions: ff_flac_parse_streaminfo(), ff_flac_decode_frame_header()
+
+=== VULNERABILITY DESCRIPTION ===
+
+In ff_flac_parse_streaminfo() (flac.c:205,215), the sample rate is read from
+the FLAC STREAMINFO metadata block as a raw 20-bit field and directly assigned
+to avctx->sample_rate without any validation that it is non-zero:
+
+    s->samplerate = get_bits(&gb, 20);       // line 205 - can be 0
+    ...
+    avctx->sample_rate = s->samplerate;       // line 215 - propagated unchecked
+
+A crafted FLAC file with samplerate=0 in its STREAMINFO block will cause
+avctx->sample_rate to be set to 0 during codec initialization (flac_decode_init).
+This value is used as a divisor in numerous places throughout FFmpeg's
+demuxing/muxing/filtering pipeline (duration calculations, timestamp
+conversions, PTS/DTS computations, resampling, etc.), resulting in a
+floating-point exception (SIGFPE) or undefined behavior.
+
+Similarly, ff_flac_decode_frame_header() (flac.c:121-135) allows samplerate=0
+to pass validation when sr_code is 12, 13, or 14:
+
+    sr_code == 12: fi->samplerate = get_bits(gb, 8) * 1000;   // 0 * 1000 = 0
+    sr_code == 13: fi->samplerate = get_bits(gb, 16);          // can be 0
+    sr_code == 14: fi->samplerate = get_bits(gb, 16) * 10;     // 0 * 10 = 0
+
+Only sr_code == 15 is rejected as invalid (line 131-134). Values 12-14 that
+resolve to 0 are silently accepted.
+
+While flacdec.c:decode_frame() has a partial check at lines 659-663 (rejects
+frames where BOTH streaminfo and frame samplerate are 0), this does NOT
+protect against:
+
+  1. The streaminfo path: avctx->sample_rate is already set to 0 at init time
+     (flac_decode_init -> ff_flac_parse_streaminfo), before any frame is decoded.
+     Any component that accesses avctx->sample_rate between init and first frame
+     decode will encounter the zero value.
+
+  2. The fallback path: if fi.samplerate==0, it falls back to
+     s->stream_info.samplerate (line 664-665), which is also 0 from streaminfo.
+     The combined check at line 659 returns error, but avctx->sample_rate was
+     ALREADY set to 0 during init and was never corrected.
+
+=== IMPACT ===
+
+- Denial of Service: Crash via SIGFPE (division by zero) when processing a
+  crafted FLAC file. This affects any application using FFmpeg's FLAC decoder
+  (ffmpeg, ffprobe, ffplay, VLC, Chromium, etc.).
+- The vulnerability is triggerable with a minimal crafted file (as small as 42
+  bytes) and requires no user interaction beyond opening/playing the file.
+- Network-exploitable: malicious FLAC files can be served via web, email, or
+  media streaming.
+
+=== ROOT CAUSE ===
+
+ff_flac_parse_streaminfo() validates bps (must be >= 4) and max_blocksize
+(must be >= FLAC_MIN_BLOCKSIZE=16) but performs NO validation on samplerate.
+The FLAC specification requires sample rate to be non-zero (valid range:
+1-655350 Hz), but this constraint is not enforced.
+
+=== SUGGESTED FIX ===
+
+Add samplerate validation in ff_flac_parse_streaminfo() after line 205:
+
+    s->samplerate = get_bits(&gb, 20);
++   if (s->samplerate == 0) {
++       av_log(avctx, AV_LOG_ERROR, "invalid sample rate: 0\n");
++       return AVERROR_INVALIDDATA;
++   }
+
+And in ff_flac_decode_frame_header() after the sample rate parsing block (after line 135):
+
++   if (fi->samplerate == 0) {
++       av_log(logctx, AV_LOG_ERROR + log_level_offset,
++              "invalid sample rate: 0\n");
++       return AVERROR_INVALIDDATA;
++   }

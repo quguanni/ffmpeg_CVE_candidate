@@ -1,0 +1,114 @@
+Vulnerability: Unbounded track_size in Enhanced FLV Multitrack Parsing Leads to
+Out-of-Bounds Read Beyond Tag Boundary
+
+Severity: HIGH (CVSS ~7.5 - Heap-based OOB read, DoS, potential info leak)
+
+File: libavformat/flvdec.c
+Function: flv_read_packet()
+Lines: 1560-1931
+
+==============================================================================
+ROOT CAUSE
+==============================================================================
+
+In flv_read_packet(), when parsing Enhanced FLV multitrack packets, the
+per-track size (track_size) is read from the stream via avio_rb24() at line
+1564 but is NEVER validated against the remaining tag size (size). This allows
+a crafted FLV file to specify a track_size up to 0xFFFFFF (16,777,215 bytes)
+while the actual remaining tag data can be as small as a few bytes.
+
+Vulnerable code path (lines 1560-1566):
+
+    for (;;) {
+        int track_size = size;
+
+        if (multitrack_type != MultitrackTypeOneTrack) {
+            track_size = avio_rb24(s->pb);   // <-- attacker-controlled, up to 16MB
+            size -= 3;                        // <-- only the 3-byte field itself is subtracted
+        }
+
+The subsequent bounds check at line 1834:
+
+    if (size <= 0 || track_size < 0) {
+
+only checks that track_size is non-negative and size is positive. It does NOT
+check that track_size <= size. When track_size >> size, the code proceeds to:
+
+    ret = av_get_packet(s->pb, pkt, track_size);   // line 1843
+
+This reads track_size bytes from the IO context, consuming data far beyond the
+current FLV tag boundary into subsequent tags or file data.
+
+==============================================================================
+IMPACT
+==============================================================================
+
+1. OUT-OF-BOUNDS READ: The demuxer reads past the FLV tag boundary. For
+   memory-mapped or buffered inputs, this can read adjacent heap memory,
+   potentially leaking sensitive data (e.g., in web-based media processing
+   pipelines where FLV data is embedded alongside other content).
+
+2. PARSER STATE CORRUPTION: After the oversized read, the 'size' variable
+   becomes deeply negative (e.g., size = 7 - 65532 = -65525). Since the
+   for(;;) loop at line 1560 only breaks on `!size` (line 1909), the negative
+   size causes the loop to continue, reading more data from subsequent FLV
+   tags and misinterpreting tag headers as track metadata (codec_id,
+   track_idx, etc.).
+
+3. DECODER EXPLOITATION: The corrupted packets are passed to downstream codec
+   decoders via ff_buffer_packet() (line 1889). An attacker can carefully
+   craft the file so that subsequent FLV tag headers are interpreted as codec
+   data, potentially triggering secondary vulnerabilities in codec decoders
+   (e.g., H.264, HEVC) with malformed input.
+
+4. DENIAL OF SERVICE: The attacker can force allocation of up to 16MB per
+   track via av_get_packet(), and the loop continues creating multiple such
+   packets, leading to excessive memory consumption and potential OOM.
+
+5. The vulnerability is triggered during normal demuxing (flv_read_packet),
+   requiring no special flags or options. Simply opening a crafted .flv file
+   with ffmpeg/ffprobe or any application using libavformat triggers it.
+
+==============================================================================
+ATTACK SCENARIO
+==============================================================================
+
+Construct an FLV file with:
+  - A video tag with Enhanced FLV flags and multitrack type ManyTracks
+  - Small tag data size (e.g., 20 bytes)
+  - Large track_size in the multitrack track_size field (e.g., 0x00FFFF)
+  - H.264 codec (triggers CTS parsing, consuming 3 bytes each from size and
+    track_size, but track_size remains huge)
+
+Execution flow:
+  1. Tag header parsed: size = 20
+  2. Enhanced FLV video header consumed: size = 13 (7 bytes for flags, multitrack
+     type, codec_id, track_idx)
+  3. track_size = 0xFFFF read from stream: size -= 3 -> size = 10
+  4. H.264 CTS parsed: size -= 3 -> 7, track_size -= 3 -> 65532
+  5. Bounds check: size(7) > 0 AND track_size(65532) >= 0 -> PASSES
+  6. av_get_packet(pb, pkt, 65532) -> reads 65532 bytes past tag boundary!
+  7. size -= bytes_read -> deeply negative
+  8. Loop continues, consuming subsequent FLV tags as track data
+
+==============================================================================
+FIX
+==============================================================================
+
+Add a bounds check after reading track_size:
+
+    if (multitrack_type != MultitrackTypeOneTrack) {
+        track_size = avio_rb24(s->pb);
+        size -= 3;
++       if (track_size > size) {
++           av_log(s, AV_LOG_ERROR, "track_size %d exceeds remaining tag size %d\n",
++                  track_size, size);
++           ret = AVERROR_INVALIDDATA;
++           goto leave;
++       }
+    }
+
+Additionally, the check at line 1834 should be strengthened:
+
+-   if (size <= 0 || track_size < 0) {
++   if (size <= 0 || track_size < 0 || track_size > size) {

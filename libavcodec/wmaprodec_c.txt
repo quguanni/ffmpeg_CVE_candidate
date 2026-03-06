@@ -1,0 +1,104 @@
+Vulnerability: Use of Uninitialized Decorrelation Matrix in WMA Pro Decoder
+File: libavcodec/wmaprodec.c
+CWE: CWE-908 (Use of Uninitialized Resource)
+Severity: Medium-High (CVSS ~6.5 - Information Disclosure / Denial of Service)
+
+== Summary ==
+
+In decode_channel_transform() (line 875-893), when a channel group has more
+than 6 coupled channels and the default (non-custom) decorrelation path is
+selected, the function sets chgroup->transform = 1 but fails to initialize
+the decorrelation_matrix. The avpriv_request_sample() call at line 883 logs
+a warning but does NOT return an error or set transform = 0. Execution
+continues normally, and inverse_channel_transform() subsequently reads and
+uses the uninitialized/stale decorrelation_matrix data.
+
+== Affected Code ==
+
+libavcodec/wmaprodec.c, decode_channel_transform(), lines 875-893:
+
+    } else if (chgroup->num_channels > 2) {
+        if (get_bits1(&s->gb)) {
+            chgroup->transform = 1;                    // [LINE 877] transform ENABLED
+            if (get_bits1(&s->gb)) {
+                decode_decorrelation_matrix(s, chgroup); // custom matrix - OK
+            } else {
+                /** FIXME: more than 6 coupled channels not supported */
+                if (chgroup->num_channels > 6) {
+                    avpriv_request_sample(s->avctx,
+                                          "Coupled channels > 6");
+                    // BUG: No return, no error, no "transform = 0".
+                    // Execution falls through with transform=1
+                    // but decorrelation_matrix is UNINITIALIZED.
+                } else {
+                    memcpy(chgroup->decorrelation_matrix,
+                           default_decorrelation[chgroup->num_channels],
+                           ...);                        // matrix set - OK
+                }
+            }
+        }
+    }
+
+The uninitialized matrix is then consumed in inverse_channel_transform()
+(lines 1118-1166), specifically at line 1138-1153 where the matrix values
+are used as multipliers against decoded audio coefficients:
+
+    const float* mat = s->chgroup[i].decorrelation_matrix;
+    ...
+    while (data_ptr < data_end)
+        sum += *data_ptr++ * *mat++;
+    (*ch)[y] = sum;
+
+== Trigger Conditions ==
+
+1. The input must be a WMA Pro stream with 7 or 8 audio channels
+   (nb_channels = 7 or 8, which is within the WMAPRO_MAX_CHANNELS=8 limit).
+2. A subframe must contain a channel group where all 7-8 channels are
+   grouped together (controlled by bitstream bits in decode_channel_transform).
+3. The bitstream must select "transform enabled" (bit=1 at line 876) and
+   "default decorrelation" (bit=0 at line 878), NOT the custom matrix path.
+4. This causes chgroup->num_channels > 6, hitting the vulnerable code path.
+
+== Impact ==
+
+- Information Disclosure: On subsequent frames, the decorrelation_matrix
+  retains stale data from previous decode_decorrelation_matrix() calls
+  (potentially from a differently-sized channel group). This stale data
+  is multiplied with current audio coefficients and written to the output
+  buffer, leaking information about previously decoded frame data through
+  the audio output.
+
+- On the first frame, priv_data is zero-initialized (av_mallocz), so the
+  matrix contains zeros, producing silent output for those channels. On
+  subsequent frames, the matrix contains attacker-controllable values from
+  a previous frame's decode_decorrelation_matrix() call, allowing the
+  attacker to influence the decorrelation computation with chosen values.
+
+- Denial of Service: The uninitialized matrix values could produce extreme
+  floating-point outputs (NaN, infinity) which propagate through IMDCT and
+  windowing, potentially causing cascading numerical instability in the
+  decoder.
+
+== Secondary Finding: Ignored decode_coeffs() Return Value ==
+
+At line 1381, the return value of decode_coeffs() is silently discarded:
+
+    if (s->channel[c].transmit_coefs &&
+        get_bits_count(&s->gb) < s->num_saved_bits) {
+        decode_coeffs(s, c);         // <-- return value IGNORED
+    }
+
+If ff_wma_run_level_decode() fails inside decode_coeffs(), the error is
+swallowed. The decoder continues with a partially-decoded coefficient buffer,
+which is then passed to inverse quantization, IMDCT, and windowing. This
+allows processing of inconsistent decoder state from crafted input.
+
+== Suggested Fix ==
+
+In decode_channel_transform(), after the avpriv_request_sample() call for
+num_channels > 6, either:
+  (a) return AVERROR_PATCHWELCOME; // reject the stream
+  (b) chgroup->transform = 0;     // disable transform for this group
+
+For the secondary issue, check decode_coeffs() return value at line 1381
+and propagate the error.

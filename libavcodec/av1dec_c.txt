@@ -1,0 +1,120 @@
+Vulnerability Report: Out-of-Bounds Read in read_global_param() — libavcodec/av1dec.c
+=====================================================================================
+
+Severity: HIGH (CWE-125: Out-of-bounds Read)
+
+Location: libavcodec/av1dec.c, function read_global_param(), lines 106-118
+
+Summary
+-------
+An unconditional out-of-bounds array read occurs in read_global_param() when
+primary_ref_frame equals AV1_PRIMARY_REF_NONE (7). The ref_frame_idx[] array
+has AV1_REFS_PER_FRAME (7) elements (valid indices 0-6), but the code
+unconditionally reads ref_frame_idx[primary_frame] at line 107 BEFORE checking
+whether primary_frame == AV1_PRIMARY_REF_NONE at line 115.
+
+Vulnerable Code (lines 100-139)
+-------------------------------
+  static void read_global_param(AV1DecContext *s, int type, int ref, int idx)
+  {
+      uint8_t primary_frame, prev_frame;
+      ...
+      primary_frame = s->raw_frame_header->primary_ref_frame;       // [A] 3-bit field, range 0-7
+      prev_frame = s->raw_frame_header->ref_frame_idx[primary_frame]; // [B] OOB when primary_frame==7!
+
+      ...
+      if (s->raw_frame_header->primary_ref_frame == AV1_PRIMARY_REF_NONE)  // [C] Guard is TOO LATE
+          prev_gm_param = s->cur_frame.gm_params[ref][idx];
+      else
+          prev_gm_param = s->ref[prev_frame].gm_params[ref][idx];  // [D] Uses OOB-read value
+      ...
+  }
+
+At [A], primary_ref_frame is a 3-bit syntax element (range 0-7) parsed by CBS.
+At [B], ref_frame_idx[] is declared as int8_t ref_frame_idx[AV1_REFS_PER_FRAME]
+(i.e., int8_t[7]), so index 7 is out of bounds. This read is UNCONDITIONAL.
+At [C], the guard checks primary_ref_frame == 7, but the OOB read already happened.
+At [D], if the guard were optimized away (see below), prev_frame would be used to
+index s->ref[] (8 elements), potentially causing a secondary OOB access.
+
+Struct Layout — What Gets Read
+------------------------------
+In cbs_av1.h, the AV1RawFrameHeader struct declares (lines 213-214):
+
+    int8_t  ref_frame_idx[AV1_REFS_PER_FRAME];          // 7 bytes
+    uint32_t delta_frame_id_minus1[AV1_REFS_PER_FRAME];  // next field
+
+ref_frame_idx[7] reads the first byte of delta_frame_id_minus1[0], which is an
+attacker-controlled bitstream value. On little-endian systems, this is the least
+significant byte of the uint32_t.
+
+The read byte is stored in prev_frame (uint8_t). If this byte exceeds 7, and the
+guard at [C] is optimized away, s->ref[prev_frame] at [D] would access memory
+beyond the 8-element ref[] array — a heap out-of-bounds read of attacker-
+controlled offset into the AV1DecContext structure.
+
+Exploitation via Undefined Behavior
+------------------------------------
+Since accessing ref_frame_idx[7] is undefined behavior in C, a standards-compliant
+compiler may assume primary_frame < 7 (because values >= 7 would make the program
+undefined). This assumption could cause the compiler to:
+
+  1. Optimize away the guard at [C] (if primary_frame < 7 is assumed, the
+     condition primary_ref_frame == AV1_PRIMARY_REF_NONE is "always false").
+  2. Always execute the else branch at [D], using the OOB-read value as an index.
+
+This transforms a "read-but-don't-use" OOB into an actively exploitable OOB read
+from s->ref[prev_frame].gm_params[ref][idx], where prev_frame can be up to 255,
+providing a ~45KB read primitive relative to s->ref[0].
+
+Call Frequency and Trigger
+--------------------------
+read_global_param() is called from global_motion_params() for every inter frame
+with global motion enabled. For frames with AFFINE transforms on all 7 references,
+the OOB read occurs up to 42 times per frame (6 params x 7 refs), amplifying the
+information leak.
+
+Trigger conditions:
+  - AV1 bitstream with an inter frame (INTER or SWITCH type)
+  - primary_ref_frame set to 7 (AV1_PRIMARY_REF_NONE)
+  - At least one reference frame with global motion (is_global[ref] = 1)
+
+Impact
+------
+  - Information disclosure: leaks heap data from adjacent struct fields
+  - Potential secondary OOB: if compiler optimizes away the guard, controlled
+    OOB read from the ref[] array with attacker-influenced offset
+  - Denial of service: corrupted gm_params cause incorrect motion compensation,
+    potentially leading to further OOB accesses in warp/MC kernels
+
+Suggested Fix
+-------------
+Move the AV1_PRIMARY_REF_NONE check BEFORE the ref_frame_idx[] access:
+
+  static void read_global_param(AV1DecContext *s, int type, int ref, int idx)
+  {
+      uint8_t primary_frame, prev_frame;
+      int32_t prev_gm_param;
+      ...
+      primary_frame = s->raw_frame_header->primary_ref_frame;
+
+      if (primary_frame == AV1_PRIMARY_REF_NONE) {
+          prev_gm_param = s->cur_frame.gm_params[ref][idx];
+      } else {
+          prev_frame = s->raw_frame_header->ref_frame_idx[primary_frame];
+          prev_gm_param = s->ref[prev_frame].gm_params[ref][idx];
+      }
+      ...
+  }
+
+Additional Findings
+-------------------
+1. Integer truncation in init_tile_data() (line 422): s->tile_num is uint16_t
+   but cur_tile_num is int. When tile_cols * tile_rows > 65535 (possible with
+   non-uniform tile spacing in large frames), the assignment truncates the value,
+   causing incorrect state tracking for tile group completion detection.
+
+2. Missing reference frame validity check in show_existing_frame path (line 1352):
+   av1_frame_replace() copies from s->ref[frame_to_show_map_idx] without verifying
+   the slot contains a valid decoded frame. update_reference_list() then propagates
+   this potentially empty state to other reference slots via refresh_frame_flags.

@@ -1,0 +1,58 @@
+Vulnerability: Integer Overflow (uint32_t to int) in smjpeg_read_packet leading to Heap Buffer Overflow
+File: libavformat/smjpegdec.c
+Severity: High (CVSS ~8.1 - Remote Code Execution / Denial of Service)
+CWE: CWE-190 (Integer Overflow or Wraparound), CWE-122 (Heap-based Buffer Overflow)
+
+Description:
+In smjpeg_read_packet() (libavformat/smjpegdec.c, lines 141-182), the local
+variable `size` is declared as `uint32_t` (line 144) and is read directly from
+the input file via `avio_rb32(s->pb)` (lines 157, 167). This value is then
+passed to `av_get_packet(s->pb, pkt, size)` (lines 158, 168), whose third
+parameter is declared as `int` (libavformat/avformat.h:424).
+
+When a crafted SMJPEG file provides a `size` value in the range 0x80000000 to
+0xFFFFFFFF, the implicit cast from uint32_t to int produces a negative value.
+This negative size propagates into append_packet_chunked() (utils.c:59), where:
+
+1. `read_size = size` assigns the negative value.
+2. The sanity check `read_size > SANE_CHUNK_SIZE/10` evaluates to false
+   (negative < positive), so no limiting is applied.
+3. `av_grow_packet(pkt, read_size)` is called with a negative grow value,
+   which can cause incorrect buffer allocation (undersized or zero-sized).
+4. `avio_read(s, pkt->data + prev_size, read_size)` is then called, where
+   the negative int may be interpreted as a large positive value by lower-level
+   read functions, causing a heap buffer overflow -- writing attacker-controlled
+   data from the file stream beyond the allocated packet buffer.
+
+Impact:
+- Remote Code Execution: An attacker can craft a malicious .mjpg (SMJPEG) file
+  that, when opened by any application using FFmpeg's libavformat (e.g.,
+  ffplay, ffmpeg, ffprobe, or any media player built on FFmpeg), triggers a
+  heap buffer overflow. This can be exploited for arbitrary code execution.
+- Denial of Service: At minimum, the overflow causes a crash (segfault).
+
+Root Cause:
+No bounds validation is performed on `size` before passing it to
+av_get_packet(). The mismatch between the uint32_t type of the local variable
+and the int type of the function parameter creates a classic integer overflow
+vulnerability.
+
+Affected Code (smjpegdec.c lines 156-158, 166-168):
+    case SMJPEG_SNDD:
+        ...
+        size = avio_rb32(s->pb);          // uint32_t, attacker-controlled
+        ret = av_get_packet(s->pb, pkt, size);  // implicit cast to int
+        ...
+    case SMJPEG_VIDD:
+        ...
+        size = avio_rb32(s->pb);          // uint32_t, attacker-controlled
+        ret = av_get_packet(s->pb, pkt, size);  // implicit cast to int
+
+Fix:
+Validate that `size` does not exceed INT_MAX before calling av_get_packet(),
+or change the type of `size` to `int` and check for negative values after
+reading. For example:
+    size = avio_rb32(s->pb);
+    if (size > INT_MAX)
+        return AVERROR_INVALIDDATA;
+    ret = av_get_packet(s->pb, pkt, size);

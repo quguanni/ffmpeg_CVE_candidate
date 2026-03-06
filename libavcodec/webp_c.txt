@@ -1,0 +1,78 @@
+VULNERABILITY: Heap Buffer Over-Read of Uninitialized Memory via Predictor Transform + Color Indexing Pixel Packing
+
+File: libavcodec/webp.c
+Severity: HIGH (CWE-908 / CWE-200 - Use of Uninitialized Resource / Information Exposure)
+
+SUMMARY:
+In the WebP lossless decoder, the inverse_prediction() function at line 913 uses
+frame->width (full image width) to determine the top-right predictor pixel (p_tr)
+boundary, but apply_predictor_transform() at line 933 iterates x only up to
+s->reduced_width. When a COLOR_INDEXING_TRANSFORM with <= 16 palette entries
+enables pixel packing, s->reduced_width < frame->width. This causes the predictor
+transform to read uninitialized heap memory at pixel positions [reduced_width,
+frame->width) in each row, leaking heap contents into decoded pixel values.
+
+DETAILED ANALYSIS:
+
+1. Root Cause (line 913 in inverse_prediction):
+
+    if (x == frame->width - 1)
+        p_tr = GET_PIXEL(frame, 0, y);
+    else
+        p_tr = GET_PIXEL(frame, x + 1, y - 1);  // <-- reads uninitialized data
+
+   The check compares x against frame->width, but the caller iterates x from 0 to
+   s->reduced_width - 1. When reduced_width < frame->width, the condition
+   x == frame->width - 1 is never true within the iteration range, so the else
+   branch always executes for x = reduced_width - 1, reading from pixel position
+   (reduced_width, y-1) which was never written during decode_entropy_coded_image().
+
+2. Trigger Path:
+
+   In decode_entropy_coded_image() (lines 624-626):
+       width = img->frame->width;
+       if (role == IMAGE_ROLE_ARGB)
+           width = s->reduced_width;
+
+   The decode loop writes pixels only at x positions [0, reduced_width).
+   The frame buffer however is allocated with frame->width = s->width (full width).
+   Pixels at positions [reduced_width, frame->width) are never initialized.
+
+3. How pixel packing sets reduced_width (parse_transform_color_indexing, line 519):
+
+       if (width_bits > 0)
+           s->reduced_width = (s->width + ((1 << width_bits) - 1)) >> width_bits;
+
+   For a palette with <= 2 colors: width_bits=3, reduced_width = ceil(width/8)
+   For a palette with <= 4 colors: width_bits=2, reduced_width = ceil(width/4)
+   For a palette with <= 16 colors: width_bits=1, reduced_width = ceil(width/2)
+
+4. Transform application order (line 1171):
+
+   Transforms are applied in REVERSE parse order. If the bitstream specifies
+   [COLOR_INDEXING, PREDICTOR], then PREDICTOR is applied first (while
+   reduced_width is still reduced), then COLOR_INDEXING unpacks pixels.
+
+5. Exploitable predictor modes:
+
+   - PRED_MODE_TR (3): Directly copies p_tr → reads uninitialized data verbatim
+   - PRED_MODE_AVG_T_AVG_L_TR (5): Mixes p_tr into average calculation
+   - PRED_MODE_AVG_T_TR (9): Averages p_t with p_tr
+   - PRED_MODE_AVG_AVG_L_TL_AVG_T_TR (10): Mixes p_tr into compound average
+
+IMPACT:
+An attacker can craft a malicious WebP file that causes the decoder to read
+uninitialized heap memory and mix it into the visible decoded pixel values.
+This constitutes a heap information disclosure vulnerability. The uninitialized
+memory could contain sensitive data from previously freed heap allocations
+(e.g., cryptographic keys, credentials, other decoded content).
+
+The frame buffer is allocated via ff_thread_get_buffer() which may reuse
+buffers from a thread pool without zeroing them, increasing the likelihood
+of recovering meaningful data from previous operations.
+
+FIX:
+In inverse_prediction(), the p_tr boundary check should use the caller's
+effective width (s->reduced_width for ARGB images) instead of frame->width.
+Alternatively, apply_predictor_transform() should pass reduced_width to
+inverse_prediction() and use it for the p_tr boundary check.

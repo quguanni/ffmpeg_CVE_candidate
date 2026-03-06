@@ -1,0 +1,99 @@
+Vulnerability: Heap Buffer Over-Read in ff_h264_decode_extradata()
+File: libavcodec/h264_parse.c
+Severity: High (Information Disclosure / Denial of Service)
+Type: CWE-125 Out-of-bounds Read
+
+=== Summary ===
+
+In ff_h264_decode_extradata(), after parsing all SPS NAL units from avcC
+extradata, the code reads the PPS count byte at line 502 without verifying
+that the pointer `p` is still within the bounds of the input buffer. If the
+SPS NAL units consume all remaining bytes in the buffer, the subsequent read
+accesses memory beyond the allocated heap buffer.
+
+=== Root Cause ===
+
+The function parses avcC-style H.264 extradata (lines 475-523). It reads the
+SPS count from byte offset 5, then iterates through SPS NALs, advancing
+pointer `p` by `nalsize` bytes each iteration (line 499). The size check at
+line 491 ensures `nalsize <= size - (p - data)`, meaning after the loop `p`
+can be exactly `data + size` (pointing one byte past the buffer end).
+
+At line 502:
+    cnt = *(p++); // Number of pps
+
+There is NO bounds check before this dereference. If p == data + size, this
+reads 1 byte past the end of the heap-allocated buffer.
+
+Furthermore, if cnt > 0, the subsequent AV_RB16(p) at line 504 reads 2 bytes
+from `p` BEFORE the bounds check at line 505, causing an additional 1-2 byte
+over-read.
+
+A secondary over-read also exists at line 490 during SPS parsing: when
+size == 7 and cnt >= 1, `p = data + 6` has only 1 byte remaining, but
+AV_RB16(p) reads 2 bytes (data[6] and data[7], where data[7] is OOB).
+While the subsequent check on line 491 would reject the NAL, the OOB read
+has already occurred.
+
+=== Affected Code ===
+
+libavcodec/h264_parse.c, function ff_h264_decode_extradata(), lines 489-514:
+
+    // Decode sps from avcC
+    cnt = *(p + 5) & 0x1f; // Number of sps
+    p  += 6;
+    for (i = 0; i < cnt; i++) {
+        nalsize = AV_RB16(p) + 2;          // [BUG #2: OOB if < 2 bytes remain]
+        if (nalsize > size - (p - data))
+            return AVERROR_INVALIDDATA;
+        ...
+        p += nalsize;
+    }
+    // Decode pps from avcC
+    cnt = *(p++); // Number of pps          // [BUG #1: NO BOUNDS CHECK - OOB read]
+    for (i = 0; i < cnt; i++) {
+        nalsize = AV_RB16(p) + 2;          // [BUG #3: OOB if < 2 bytes remain]
+        if (nalsize > size - (p - data))
+            return AVERROR_INVALIDDATA;
+        ...
+        p += nalsize;
+    }
+
+=== Impact ===
+
+1. Information Disclosure: The over-read can leak up to 2 bytes of adjacent
+   heap memory. In scenarios where FFmpeg processes untrusted media (e.g.,
+   web browsers, media servers), this could leak sensitive heap data.
+
+2. Denial of Service: Depending on heap layout, the over-read could access
+   unmapped memory and cause a segmentation fault / crash.
+
+3. ASLR/Heap metadata leak: In exploitation chains, even a 1-2 byte heap
+   over-read can reveal heap metadata or adjacent object contents useful for
+   bypassing ASLR or constructing further exploits.
+
+=== Trigger Conditions ===
+
+- Input must be an H.264 stream with avcC-style extradata (data[0] == 1)
+- size >= 7 (passes the minimum size check)
+- The SPS NAL entries must consume exactly all remaining bytes after the
+  6-byte avcC header, leaving 0 bytes for the PPS count field
+- Example: size=8, data[5]=0x01 (1 SPS), SPS nalsize=2 (AV_RB16=0),
+  causing p to advance to data+8 == data+size, then *(p++) reads OOB
+
+=== Suggested Fix ===
+
+Add bounds checks before each pointer dereference:
+
+    // After SPS loop, before reading PPS count:
+    if (p >= data + size) {
+        av_log(logctx, AV_LOG_ERROR, "avcC too short for PPS count\n");
+        return AVERROR_INVALIDDATA;
+    }
+    cnt = *(p++);
+
+    // Before AV_RB16 reads (both SPS and PPS loops):
+    if (size - (p - data) < 2) {
+        return AVERROR_INVALIDDATA;
+    }
+    nalsize = AV_RB16(p) + 2;

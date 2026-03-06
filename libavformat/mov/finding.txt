@@ -1,0 +1,63 @@
+File: libavformat/mov.c
+Function: mov_build_index
+Line: 4915
+Bug Class: Integer Overflow (unsigned arithmetic)
+Severity: Medium (theoretical; practical exploitation is limited)
+
+Root Cause:
+-----------
+In mov_build_index() at line 4915, the variable `total` (unsigned int) is
+computed as:
+
+    total += chunk_count * count;
+
+where:
+  - chunk_count = number of chunks for the current stsc group
+  - count = samples_per_chunk from stsc_data[].count
+
+Both values are read from the file (stsc and stco atoms). If
+chunk_count * count overflows 32 bits, `total` wraps around to a small value.
+This `total` is later used at line 4924 to allocate:
+
+    av_malloc_array(total, sizeof(*st_index))
+
+The allocation succeeds with a small (wrapped) size. However, the subsequent
+write loop at line 4962:
+
+    for (i = 0; i < total; i++)
+
+is bounded by the same overflowed `total`, so the write loop itself does not
+overflow the allocation.
+
+The real risk is in the interaction with sample_sizes[]. At line 4979:
+
+    current_offset += sc->sample_sizes[current_sample];
+
+where current_sample increments past the sample_sizes array bounds when the
+overflowed `total` causes incorrect sample indexing relative to sc->sample_count.
+However, sanity_checks() at line 5164 validates that stsc/stco/stsz/stts are
+consistent before mov_build_index is called, preventing the most dangerous
+mismatches in well-formed attack scenarios.
+
+Additional finding (informational):
+------------------------------------
+File: libavformat/mov.c
+Function: mov_read_stts
+Line: 3557
+
+Inside the stts reading loop, sc->stts_count is set to min_entries before the
+loop body, meaning if the loop exits early due to EOF (avio_feof), stts_count
+may be larger than the number of entries actually read. The allocated array has
+space for min_entries elements, so this doesn't cause a heap overflow, but
+leads to use of uninitialized data in subsequent stts array accesses.
+
+Defense-in-depth observations:
+------------------------------
+FFmpeg's MOV parser is extremely well-hardened:
+- av_malloc_array/av_calloc have internal overflow protection
+- sanity_checks() validates stsc/stco/stts/stsz consistency
+- atom.size bounds are enforced by mov_read_default
+- Most array accesses have explicit bounds checks
+- HEIF/AVIF parsing validates item IDs and indices
+- The atom_depth limit (10) prevents recursion attacks
+- av_fast_realloc only grows, never shrinks

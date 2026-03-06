@@ -1,0 +1,150 @@
+Vulnerability: Integer Overflow in Golomb/Rice Decoding Leading to Attacker-Controlled
+Residue Values in WMA Lossless Decoder
+File: libavcodec/wmalosslessdec.c
+CWE: CWE-190 (Integer Overflow or Wraparound)
+Severity: High (CVSS ~7.5 - Denial of Service / Potential Code Execution)
+
+== Summary ==
+
+In decode_channel_residues() (lines 541-563), the Golomb/Rice entropy decoding
+logic allows a crafted bitstream to produce an unbounded quotient (quo) value
+via unary coding. When quo >= 32, an extended coding path reads up to 32
+additional bits and adds them to quo without any upper-bound check. The
+resulting quo is then left-shifted by a variable number of bits (rem_bits)
+derived from a moving average, causing unsigned integer overflow. The
+overflowed residue value is stored into channel_residues[] and propagates
+unchecked through multiple filter stages (CDLMS, MCLMS, inter-channel
+decorrelation, AC filter, dequantization), causing cascading integer
+overflows and undefined behavior throughout the decode pipeline.
+
+== Affected Code ==
+
+libavcodec/wmalosslessdec.c, decode_channel_residues(), lines 541-563:
+
+    unsigned quo = 0, residue;
+    while(get_bits1(&s->gb)) {
+        quo++;                                      // [LINE 543] unbounded increment
+        if (get_bits_left(&s->gb) <= 0)
+            return -1;
+    }
+    if (quo >= 32)
+        quo += get_bits_long(&s->gb, get_bits(&s->gb, 5) + 1);
+                                                    // [LINE 548] quo can reach ~2^32
+                                                    // No upper bound validation
+
+    ave_mean = (s->ave_sum[ch] + (1 << s->movave_scaling)) >> (s->movave_scaling + 1);
+    if (ave_mean <= 1)
+        residue = quo;
+    else {
+        rem_bits = av_ceil_log2(ave_mean);           // [LINE 554] up to 31
+        rem      = get_bits_long(&s->gb, rem_bits);
+        residue  = (quo << rem_bits) + rem;          // [LINE 556] INTEGER OVERFLOW
+                                                     // quo << rem_bits discards high bits
+    }
+
+    s->ave_sum[ch] = residue + s->ave_sum[ch] -
+                     (s->ave_sum[ch] >> s->movave_scaling);
+                                                     // [LINE 559] ave_sum feedback loop:
+                                                     // large residue -> large ave_mean
+                                                     // -> large rem_bits -> more overflow
+
+    residue = (residue >> 1) ^ -(residue & 1);       // zigzag decode
+    s->channel_residues[ch][i] = residue;             // [LINE 563] attacker-controlled
+                                                      // value stored as signed int
+
+The attacker-controlled residue values then propagate through:
+
+1. Dequantization (line 990): channel_residues[i][j] *= (unsigned)quant_stepsize
+   - quant_stepsize is 1-256 (attacker-controlled via bitstream)
+   - Multiplication of large residue * 256 overflows
+
+2. revert_cdlms16/32 (lines 771-786): residue used as input to LMS filter
+   - input = residue + (unsigned)((int)pred >> scaling)
+   - Unbounded input stored back to channel_residues[ch][icoef]
+
+3. revert_mclms (lines 690-697): residues used in multi-channel LMS
+   - pred[ich] += (uint32_t)channel_residues[i][icoef] * mclms_coeffs_cur[...]
+   - channel_residues[ich][icoef] += (unsigned)pred[ich]
+   - Integer overflow in prediction accumulation
+
+4. revert_acfilter (lines 804-837): residues multiplied with filter coefficients
+   - pred += (uint32_t)channel_residues[ich][i-j-1] * filter_coeffs[j]
+   - pred is signed int; accumulated unsigned products cause signed overflow
+   - This is UNDEFINED BEHAVIOR in C, not just wraparound
+
+5. Output stage (lines 998-1004):
+   - 16-bit: (int16_t)channel_residues[c][j] * (1 << padding_zeroes)
+   - 24-bit: channel_residues[c][j] * (256U << padding_zeroes)
+
+== Trigger Conditions ==
+
+1. Input must be a valid WMA Lossless stream (extradata_size >= 18,
+   bits_per_sample = 16 or 24).
+2. A subframe must have seekable_tile=1 to initialize the moving average
+   (ave_sum) to a controlled value via get_bits(&s->gb, bits_per_sample).
+3. The Golomb-coded residue data must contain >= 32 consecutive 1-bits
+   followed by a 0-bit (unary part), triggering the extended coding path.
+4. The 5-bit length field and subsequent data bits are crafted to maximize
+   quo, and the initial ave_sum seeds rem_bits to a value that causes
+   maximal overflow in (quo << rem_bits).
+5. Multiple iterations of the residue decoding loop amplify the issue
+   through the ave_sum feedback loop.
+
+== Impact ==
+
+- Denial of Service: The cascading integer overflows produce extreme values
+  that propagate through the filter chain, causing numerical instability.
+  The signed integer overflow in revert_acfilter() (pred accumulation) is
+  undefined behavior in C, which may cause crashes or unpredictable control
+  flow depending on compiler optimizations.
+
+- Information Corruption: The attacker can control the decoded audio output
+  via crafted residue values, potentially leaking information about internal
+  decoder state through output samples.
+
+- Potential Code Execution: Under aggressive compiler optimizations (e.g.,
+  -O2 with GCC), the undefined behavior from signed integer overflow in the
+  AC filter prediction loop may be exploited. The compiler may assume signed
+  overflow cannot occur and optimize away subsequent bounds checks, creating
+  exploitable conditions.
+
+== Secondary Finding: Off-by-One in padding_zeroes Validation ==
+
+At line 961, the non-rawpcm path checks:
+    if (s->bits_per_sample < padding_zeroes)
+        return AVERROR_INVALIDDATA;
+
+This allows padding_zeroes == bits_per_sample. Compare with the rawpcm path
+(line 948-952) which correctly requires bits_per_sample - padding_zeroes > 0.
+
+For 24-bit samples with padding_zeroes=24: 256U << 24 = 2^32 = 0 (unsigned
+wraparound). All output samples become zero regardless of decoded residues.
+
+For 16-bit samples with padding_zeroes=16: (1 << 16) = 65536. The
+multiplication (int16_t)val * 65536 effectively discards the decoded data.
+
+The check should be (s->bits_per_sample <= padding_zeroes) to match the
+rawpcm validation logic.
+
+== Suggested Fix ==
+
+1. In decode_channel_residues(), add an upper-bound check on quo after the
+   extended coding at line 548:
+     if (quo >= 32)
+         quo += get_bits_long(&s->gb, get_bits(&s->gb, 5) + 1);
+  +  if (quo > 0xFFFFFF) {  /* reasonable upper bound */
+  +      av_log(s->avctx, AV_LOG_ERROR, "invalid quo %u\n", quo);
+  +      return AVERROR_INVALIDDATA;
+  +  }
+
+2. Add overflow checks before the shift at line 556:
+  +  if (rem_bits > 0 && quo > (UINT_MAX >> rem_bits)) {
+  +      av_log(s->avctx, AV_LOG_ERROR, "residue overflow\n");
+  +      return AVERROR_INVALIDDATA;
+  +  }
+     residue = (quo << rem_bits) + rem;
+
+3. Fix the padding_zeroes check at line 961:
+  -  if (s->bits_per_sample < padding_zeroes)
+  +  if (s->bits_per_sample <= padding_zeroes)
+         return AVERROR_INVALIDDATA;

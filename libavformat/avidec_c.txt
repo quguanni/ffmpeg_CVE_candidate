@@ -1,0 +1,100 @@
+VULNERABILITY: Integer Underflow in avi_read_header() chunk size handling
+         leading to Out-of-Bounds Read and Parser State Corruption
+
+FILE: libavformat/avidec.c
+FUNCTION: avi_read_header()
+SEVERITY: High (CVSS ~7.8 - potential code execution via controlled stream parameters)
+TYPE: CWE-191 (Integer Underflow), CWE-125 (Out-of-bounds Read)
+
+SUMMARY
+=======
+Multiple chunk handlers in avi_read_header() read a fixed number of bytes from
+the I/O stream and then call avio_skip(pb, size - N*4) to skip remaining chunk
+data, but fail to validate that `size` (an unsigned int read directly from the
+file) is at least as large as the number of bytes already consumed. When a
+crafted AVI file provides a chunk size smaller than expected, this causes:
+
+  1. Out-of-bounds read: fields are populated from data beyond the declared
+     chunk boundary (adjacent attacker-controlled chunks).
+  2. Integer underflow: `size - N*4` wraps around to a large positive value
+     (~4GB), causing avio_skip to seek far past the intended position.
+  3. Attacker-controlled stream parameters: the OOB-read values are stored in
+     critical AVIStream fields (sample_size, scale, rate, cum_len) that
+     directly influence buffer allocations and loop iteration counts during
+     subsequent packet reading.
+
+AFFECTED LOCATIONS
+==================
+
+1. strh handler (MOST CRITICAL) - line 759:
+   avio_skip(pb, size - 12 * 4);
+   The code reads exactly 48 bytes (12 x 32-bit fields) including:
+     - ast->scale      (line 682)
+     - ast->rate       (line 683)
+     - ast->cum_len    (line 700)
+     - ast->sample_size (line 710)
+   If size < 48, adjacent chunk data is read into these fields. Then
+   (size - 48) underflows to ~0xFFFFFFD0, causing a massive skip.
+
+2. avih handler - line 600:
+   avio_skip(pb, size - 10 * 4);
+   Reads 40 bytes. If size < 40, underflow occurs. Values for avih_width
+   and avih_height come from adjacent data.
+
+3. strh DV path - line 671:
+   avio_skip(pb, size - 9 * 4);
+   Reads 36 bytes in the DV demux path. Same underflow if size < 36.
+
+4. strh pads path - line 609:
+   avio_skip(pb, size - 8);
+   Reads 8 bytes. If size < 8, underflow occurs.
+
+EXPLOITATION SCENARIO
+=====================
+A crafted AVI file with a strh chunk declaring size=8 (instead of the
+expected >=48) causes:
+
+  Step 1: tag1 and handler are read from the 8-byte chunk (valid).
+  Step 2: The remaining 40 bytes of stream header fields (flags, priority,
+          language, initial_frame, scale, rate, start, nb_frames, buf_size,
+          quality, sample_size) are read from ADJACENT chunk data that the
+          attacker fully controls.
+  Step 3: avio_skip(pb, 8 - 48) = avio_skip(pb, 0xFFFFFFD8) seeks ~4GB
+          forward, corrupting parser state.
+
+  The attacker-controlled sample_size value directly influences:
+    - get_duration() calculations (line 139-147)
+    - Buffer allocation sizes in avi_read_packet (lines 1506-1512)
+    - Division operations (line 1553: pkt->dts /= ast->sample_size)
+      where sample_size=0 causes division by zero
+
+  The attacker-controlled scale/rate values influence:
+    - avpriv_set_pts_info() timebase (line 698)
+    - Duration and seek calculations throughout the demuxer
+
+ROOT CAUSE
+==========
+The chunk size `size` is read as unsigned int from avio_rl32(pb) at line 545
+and is never validated against a minimum bound before the fixed-format reads
+begin. The subtraction `size - N*4` is performed in unsigned arithmetic,
+wrapping to a large positive value when size < N*4.
+
+FIX
+===
+Add minimum size validation before reading fixed-format fields:
+
+  case MKTAG('a', 'v', 'i', 'h'):
++     if (size < 10 * 4)
++         return AVERROR_INVALIDDATA;
+      /* read avih fields */
+      ...
+
+  case MKTAG('s', 't', 'r', 'h'):
++     if (size < 12 * 4)  // or at least validate before the skip
++         return AVERROR_INVALIDDATA;
+      /* read strh fields */
+      ...
+
+Alternatively, compute the skip as:
+  if (size > 12 * 4)
+      avio_skip(pb, size - 12 * 4);

@@ -1,0 +1,101 @@
+VULNERABILITY: Heap Buffer Overflow via Integer Overflow in matroska_parse_rm_audio()
+
+File: libavformat/matroskadec.c
+Severity: HIGH (Heap buffer overflow write - potential RCE)
+Affected codecs: COOK, ATRAC3 (RealAudio codecs in Matroska container)
+
+=== SUMMARY ===
+
+An integer overflow in the buffer offset calculation within matroska_parse_rm_audio()
+allows a crafted Matroska (.mkv) file to write data before the allocated heap buffer
+(heap underflow/overflow), potentially enabling arbitrary code execution.
+
+=== ROOT CAUSE ===
+
+In matroska_parse_rm_audio() at line 3635-3638, the destination offset for a memcpy
+is computed entirely in 32-bit `int` arithmetic:
+
+    for (x = 0; x < w / sps; x++)
+        memcpy(track->audio.buf +
+               sps * (h * x + ((h + 1) / 2) * (y & 1) + (y >> 1)),
+               data + x * sps, sps);
+
+The variables h (sub_packet_h), w (frame_size), sps (sub_packet_size), x, and y are
+all `int` type. These values are parsed from attacker-controlled codec private data
+at lines 2759-2761 using bytestream_get_be16(), allowing values up to 65535.
+
+The buffer is correctly allocated at line 2786-2787 using av_malloc_array() which
+uses size_t arithmetic and properly handles large products:
+
+    track->audio.buf = av_malloc_array(track->audio.sub_packet_h,
+                                        track->audio.frame_size);
+
+However, the offset expression `sps * (h * x + ...)` is computed in `int`, which
+overflows when h * w > INT_MAX (approximately 2^31). Since h and w are both 16-bit
+values, their product can reach up to 65535 * 65535 = ~4.3 billion, far exceeding
+INT_MAX = 2,147,483,647.
+
+When the int multiplication overflows, the offset wraps to a NEGATIVE value, causing
+the memcpy to write to memory BEFORE the buffer — a heap buffer underflow.
+
+=== SECOND OVERFLOW (OOB Read + Infinite Loop) ===
+
+At line 3645, another integer overflow occurs:
+
+    track->audio.pkt_cnt = h * w / a;
+
+With h * w > INT_MAX, this overflows to a negative value. Since the subsequent
+while loop (line 3649) checks `while (track->audio.pkt_cnt)`, a negative pkt_cnt
+is non-zero, causing the loop to run for approximately 2^32 iterations. During
+these iterations, the read offset at line 3657-3658:
+
+    memcpy(pkt->data,
+           track->audio.buf + a * (h * w / a - track->audio.pkt_cnt--), a);
+
+will eventually access memory far beyond the buffer boundary (out-of-bounds read),
+and the loop itself constitutes a denial-of-service.
+
+=== ATTACK SCENARIO ===
+
+1. Attacker crafts a Matroska file with:
+   - An audio track with codec_id = "A_REAL/COOK" (or "A_REAL/ATRAC3")
+   - CodecPrivate containing: sub_packet_h=65535, frame_size=65534, sub_packet_size=2
+   - A SimpleBlock with at least 65534 bytes of audio data
+
+2. When FFmpeg opens and reads the file, mka_parse_audio_codec() parses the
+   codec private data and allocates a ~4GB buffer (succeeds on 64-bit systems).
+
+3. On the FIRST audio block, matroska_parse_rm_audio() enters the COOK/ATRAC3
+   copy loop. At x=32766 (the last iteration), the offset calculation overflows:
+     sps * (h * x + y/2) = 2 * (65535*32766 + 0) = 2 * 2,147,352,090 = 4,294,704,180
+   This overflows int to -263,116, causing a write 263,116 bytes BEFORE the buffer.
+
+4. The attacker controls the data being written (from the audio block payload),
+   enabling potential heap metadata corruption and arbitrary code execution.
+
+=== VALIDATION CONSTRAINTS (why the values pass all existing checks) ===
+
+- Line 2753: codec_priv.size >= 46 — satisfied with a 46+ byte CodecPrivate
+- Line 2762-2765: coded_framesize > 0, sub_packet_h > 0, frame_size > 0 — all true
+- Line 2780-2782: sub_packet_size > 0 AND frame_size % sub_packet_size == 0 — 65534 % 2 == 0
+- Line 2786: av_malloc_array(65535, 65534) succeeds on 64-bit (uses size_t)
+- Line 3630: size >= w — satisfied with block data >= 65534 bytes
+- NO CHECK exists that h * w fits in int, or that the offset computation is safe
+
+=== SUGGESTED FIX ===
+
+Add validation that h * w does not overflow int, or cast the offset computation
+to use int64_t / size_t arithmetic:
+
+Option A (reject unsafe values):
+    if ((int64_t)track->audio.sub_packet_h * track->audio.frame_size > INT_MAX)
+        return AVERROR_INVALIDDATA;
+
+Option B (use safe arithmetic in the offset):
+    for (x = 0; x < w / sps; x++)
+        memcpy(track->audio.buf +
+               (size_t)sps * ((size_t)h * x + ((h + 1) / 2) * (y & 1) + (y >> 1)),
+               data + x * sps, sps);
+
+And fix the pkt_cnt computation:
+    track->audio.pkt_cnt = (int64_t)h * w / a;

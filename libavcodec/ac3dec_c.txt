@@ -1,0 +1,69 @@
+Vulnerability: Heap Buffer Over-Read via GetBitContext Size Mismatch in AC-3/E-AC-3 Decoder
+
+File: libavcodec/ac3dec.c
+Function: ac3_decode_frame()
+Lines: 1371-1388, 1543-1569
+
+== Summary ==
+
+In ac3_decode_frame(), the input packet data is copied into a fixed-size
+internal buffer (s->input_buffer, AC3_FRAME_BUFFER_SIZE = 32768 bytes), but the
+GetBitContext bitstream reader is initialized with the original packet size
+(buf_size), which can be much larger. When the decoder processes chained E-AC-3
+dependent frames via the "goto dependent_frame" loop, the cumulative read offset
+can exceed the allocated buffer, causing the bitstream reader to access heap
+memory beyond the input_buffer allocation.
+
+== Detailed Analysis ==
+
+1. Buffer copy is capped (line 1377):
+   memcpy(s->input_buffer, buf, FFMIN(buf_size, AC3_FRAME_BUFFER_SIZE));
+   Only min(buf_size, 32768) bytes are copied into input_buffer.
+
+2. GetBitContext initialized with UNCAPPED buf_size (line 1385-1388):
+   buf = s->input_buffer;
+   dependent_frame:
+   init_get_bits8(&s->gbc, buf, buf_size);
+   The bitstream reader believes buf_size bytes are available, but only
+   min(buf_size, 32768) bytes actually exist in the buffer.
+
+3. Dependent frame loop amplifies the offset (lines 1543-1569):
+   After processing a frame, the code checks for a dependent frame:
+   - Parses a header from buf + s->frame_size (line 1553)
+   - If it's EAC3_FRAME_TYPE_DEPENDENT, advances buf and loops (line 1564-1569):
+       buf += s->frame_size;
+       buf_size -= s->frame_size;
+       goto dependent_frame;
+   Each iteration advances buf further into input_buffer. An attacker can craft
+   a packet containing many small valid-looking dependent E-AC-3 frames. After
+   enough iterations, buf points past input_buffer + AC3_FRAME_BUFFER_SIZE,
+   and the GetBitContext reads from unallocated heap memory.
+
+4. input_buffer allocation (ac3dec.h line 258):
+   DECLARE_ALIGNED(32, uint8_t, input_buffer)[AC3_FRAME_BUFFER_SIZE + AV_INPUT_BUFFER_PADDING_SIZE];
+   Total allocation ~32832 bytes (32768 + 64 padding). Any read past this is
+   an out-of-bounds heap access.
+
+== Impact ==
+
+- Heap buffer over-read: the decoder reads attacker-controlled amounts of data
+  from heap memory adjacent to input_buffer. This can disclose sensitive
+  information from the process heap.
+- Potential crash: reading from unmapped memory pages causes a segfault.
+- Severity: HIGH. Triggered by a crafted media file, no user interaction beyond
+  opening the file. Affects all builds with AC-3/E-AC-3 decoding enabled.
+
+== Root Cause ==
+
+The fix should use the capped size for init_get_bits8:
+   init_get_bits8(&s->gbc, buf, FFMIN(buf_size, AC3_FRAME_BUFFER_SIZE));
+Or alternatively, cap buf_size after the copy:
+   buf_size = FFMIN(buf_size, AC3_FRAME_BUFFER_SIZE);
+
+== Trigger Conditions ==
+
+1. Input packet size > AC3_FRAME_BUFFER_SIZE (32768 bytes)
+2. Packet contains a valid independent E-AC-3 frame followed by multiple
+   small dependent frames whose cumulative sizes exceed 32768
+3. Each dependent frame must have a parseable E-AC-3 sync header (0x0B77)
+   with frame_type == EAC3_FRAME_TYPE_DEPENDENT (value 1)

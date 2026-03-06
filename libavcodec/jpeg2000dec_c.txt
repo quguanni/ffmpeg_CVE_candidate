@@ -1,0 +1,85 @@
+Vulnerability: Heap Buffer Over-Read in get_cap() via Insufficient Bounds Check
+File: libavcodec/jpeg2000dec.c
+Function: get_cap()
+Lines: 452-462
+Severity: HIGH (CVSS ~7.5)
+Type: CWE-125 (Out-of-bounds Read)
+
+== Summary ==
+
+The get_cap() function, which parses the CAP (Extended Capabilities) marker
+segment in JPEG 2000 codestreams, contains a heap buffer over-read vulnerability
+due to an insufficient bounds check before reading variable-length data with
+unchecked byte-stream accessors.
+
+== Root Cause ==
+
+At line 452, the function checks:
+
+    if (bytestream2_get_bytes_left(&s->g) < 6)
+        return AVERROR_INVALIDDATA;
+
+This verifies only 6 bytes are available: 4 bytes for Pcap + 2 bytes for a
+minimum of one Ccap_i entry.
+
+However, starting at line 459, a loop iterates over all 32 bits of Pcap:
+
+    for (int i = 0; i < 32; i++) {
+        if ((Pcap >> (31 - i)) & 1)
+            Ccap_i[i] = bytestream2_get_be16u(&s->g);
+    }
+
+Each set bit in Pcap causes a 2-byte read using bytestream2_get_be16u() -- the
+"u" (unchecked/unsafe) variant that does NOT perform bounds checking. If Pcap
+has N bits set, the loop reads 2*N bytes. With all 32 bits set, this reads
+64 bytes of Ccap data, but only 2 bytes were verified to be available after
+reading Pcap.
+
+The required check should be:
+
+    if (bytestream2_get_bytes_left(&s->g) < 4 + 2 * popcount(Pcap))
+
+Or alternatively, the loop should use the safe bytestream2_get_be16() accessor
+(without the "u" suffix), which returns 0 on underflow instead of reading
+out-of-bounds memory.
+
+== Impact ==
+
+1. Information Disclosure: The over-read accesses heap memory beyond the
+   allocated input buffer, potentially leaking sensitive data from adjacent
+   heap allocations.
+
+2. Denial of Service (Crash): Reading beyond the allocated buffer can trigger
+   a segmentation fault or ASAN/MSAN violation, crashing the decoder process.
+
+3. The vulnerability is remotely triggerable by providing a crafted JPEG 2000
+   file (e.g., embedded in a video stream, web page image, or document) to
+   any application using FFmpeg's jpeg2000 decoder.
+
+== Trigger Condition ==
+
+A crafted JPEG 2000 codestream containing:
+- A valid SIZ marker (required before CAP)
+- A CAP marker segment with:
+  - Marker length indicating a short segment (e.g., Lcap = 8, meaning 6 bytes
+    of content: 4 for Pcap + 2 for one Ccap)
+  - Pcap value with many bits set (e.g., 0xFFFFFFFF = all 32 bits set)
+  - Only 2 bytes of actual Ccap data following Pcap
+
+This causes the loop to attempt reading up to 64 bytes of Ccap values while
+only 2 bytes exist, resulting in a heap over-read of up to 62 bytes.
+
+== Fix ==
+
+Either:
+(a) Read Pcap first, count set bits, then verify sufficient bytes remain:
+
+    Pcap = bytestream2_get_be32u(&s->g);
+    int num_ccap = __builtin_popcount(Pcap);
+    if (bytestream2_get_bytes_left(&s->g) < 2 * num_ccap) {
+        av_log(s->avctx, AV_LOG_ERROR, "Underflow in CAP marker\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+(b) Use the bounds-checked bytestream2_get_be16() instead of
+    bytestream2_get_be16u() in the loop.

@@ -1,0 +1,90 @@
+Vulnerability: Integer Overflow in BMP Decoder Size Validation Leading to Heap Buffer Over-Read
+
+File: libavcodec/bmp.c
+Function: bmp_decode_frame()
+Lines: 214-222
+
+SUMMARY:
+The BMP decoder computes the file line stride `n` and validates that the input
+buffer contains sufficient data via `n * avctx->height > dsize`. Both `n` and
+`avctx->height` are `int`, so their multiplication is performed as signed 32-bit
+arithmetic and can overflow, wrapping to a negative value. Since a negative value
+is always less than the positive `dsize`, the size check is bypassed. The decoder
+then proceeds to copy `n` bytes per scanline for `height` iterations from the
+input buffer via memcpy, reading far beyond the allocated input buffer (heap
+buffer over-read), causing a crash or potential information disclosure.
+
+DETAILS:
+
+Line 214:
+    n = ((avctx->width * depth + 31) / 8) & ~3;
+
+This computes the padded line size in the BMP file. For depth=24 (BGR24),
+n ≈ 3 * width.
+
+Lines 216-222:
+    if (n * avctx->height > dsize && comp != BMP_RLE4 && comp != BMP_RLE8) {
+        n = (avctx->width * depth + 7) / 8;
+        if (n * avctx->height > dsize) {
+            ...
+            return AVERROR_INVALIDDATA;
+        }
+    }
+
+Both `n * avctx->height` multiplications use int*int = int arithmetic. When the
+true product exceeds INT_MAX (2,147,483,647), the result wraps to a negative
+value, and the comparison `negative_value > dsize` evaluates to false, bypassing
+the safety check entirely.
+
+Lines 310-314:
+    for (i = 0; i < avctx->height; i++) {
+        memcpy(ptr, buf, n);
+        buf += n;
+        ptr += linesize;
+    }
+
+With the size check bypassed, this loop reads n*height bytes from buf, which
+only has dsize bytes of valid data. This causes a massive heap buffer over-read.
+
+TRIGGERING CONDITIONS:
+- depth=24, width=16,000,000, height=45
+- n = 3 * 16,000,000 = 48,000,000
+- n * height = 48,000,000 * 45 = 2,160,000,000 > INT_MAX
+- As signed int32: wraps to approximately -2,134,967,296 (negative)
+- width * height = 720,000,000 < INT_MAX, so ff_set_dimensions() accepts it
+- The size check is bypassed, and memcpy reads 2.16 GB from a small input buffer
+
+SECONDARY ISSUE - Unchecked Buffer Reads in BITFIELDS Parsing (Lines 126-133):
+When ihsize=40 and comp=BMP_BITFIELDS, the code reads 12-16 bytes of bitfield
+masks from offsets 54-69 of the input buffer. However, the only validation
+ensures buf_size > hsize, where hsize can be as low as 54 (ihsize + 14). With
+buf_size between 55-69, these reads access memory beyond the declared buffer.
+While AV_INPUT_BUFFER_PADDING_SIZE (64 bytes) provides a safety margin, the
+reads are still logically out-of-bounds relative to the declared packet size.
+
+ADDITIONAL ISSUE - Integer Overflow in RLE memset (Line 230):
+    memset(p->data[0], 0, avctx->height * p->linesize[0]);
+
+avctx->height * p->linesize[0] can overflow int. If the overflowed int value
+is negative, implicit conversion to size_t (unsigned 64-bit) produces an
+enormous value, causing memset to write far beyond the frame buffer — a heap
+buffer overflow leading to crash or potential code execution.
+
+ROOT CAUSE:
+The BMP decoder uses unchecked signed integer arithmetic for size calculations
+and buffer validation. The fundamental issue is that int*int multiplication
+is used for values whose true product can exceed INT_MAX, without overflow
+detection or the use of wider integer types (e.g., int64_t or size_t).
+
+IMPACT:
+- Denial of Service (crash via segfault on OOB read)
+- Potential information disclosure (heap data leaked into decoded frame)
+- Potential heap corruption (via RLE memset overflow)
+
+SEVERITY: High
+
+FIX:
+Use 64-bit arithmetic for size validation:
+    if ((int64_t)n * avctx->height > dsize && ...)
+and:
+    memset(p->data[0], 0, (size_t)avctx->height * p->linesize[0]);

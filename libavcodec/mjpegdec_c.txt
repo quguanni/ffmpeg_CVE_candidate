@@ -1,0 +1,102 @@
+Vulnerability: Heap Buffer Over-Read in mjpeg_decode_dri() via Unsafe Bytestream Read on Insufficient Buffer
+File: libavcodec/mjpegdec.c
+Severity: Medium-High (CWE-125: Out-of-bounds Read)
+
+SUMMARY:
+The function mjpeg_decode_dri() at line 1835 performs two unsafe, bounds-unchecked
+reads (bytestream2_get_be16u) totaling 4 bytes without first verifying that the
+GetByteContext buffer contains sufficient data. When a crafted JPEG file places a
+DRI marker (0xFF 0xDD) at or near the end of the input buffer such that fewer than
+4 bytes of payload remain, the function reads 2-4 bytes beyond the allocated heap
+buffer boundary.
+
+ROOT CAUSE:
+In ff_mjpeg_decode_frame_from_buf() (line 2394), the main marker parsing loop
+initializes the GetByteContext s->gB with the remaining bytes after the marker:
+
+    bytestream2_init(&s->gB, buf_ptr, bytes_left);   // line 2437
+
+where bytes_left = buf_end - buf_ptr. After ff_mjpeg_find_marker() consumes the
+marker bytes (0xFF + marker_type), buf_ptr points past the marker, and bytes_left
+can be 0, 1, 2, or 3.
+
+Then mjpeg_decode_dri() is called (line 2597), which immediately does:
+
+    static int mjpeg_decode_dri(MJpegDecodeContext *s)
+    {
+        if (bytestream2_get_be16u(&s->gB) != 4)     // line 1837 - reads 2 bytes UNSAFELY
+            return AVERROR_INVALIDDATA;
+        s->restart_interval = bytestream2_get_be16u(&s->gB);  // line 1839 - reads 2 more bytes UNSAFELY
+        ...
+    }
+
+The bytestream2_get_be16u() function is the UNSAFE variant that does NOT check
+buffer boundaries before reading. It directly dereferences the buffer pointer:
+
+    static av_always_inline unsigned int bytestream2_get_be16u(GetByteContext *g)
+    {
+        unsigned int tmp = AV_RB16(g->buffer);    // reads g->buffer[0] and g->buffer[1]
+        g->buffer += 2;
+        return tmp;
+    }
+
+When bytes_left is 0 or 1, this reads 1-2 bytes beyond the end of the allocated
+input buffer on the heap.
+
+ADDITIONALLY AFFECTED:
+The same class of vulnerability exists in mjpeg_parse_len() (line 193-201), which
+is the common length-parsing function called by ALL other marker handlers:
+
+    static int mjpeg_parse_len(MJpegDecodeContext *s, int *plen, const char *name)
+    {
+        int len = bytestream2_get_be16u(&s->gB);    // line 195 - UNSAFE 2-byte read
+        if (len < 2 || bytestream2_get_bytes_left(&s->gB) < (len - 2)) {
+            ...
+            return AVERROR_INVALIDDATA;
+        }
+        ...
+    }
+
+The bounds check at line 196 occurs AFTER the unsafe read at line 195. This means
+any marker type processed through mjpeg_parse_len (SOF0-3, DHT, DQT, SOS, COM,
+APP0-15) can also trigger a 2-byte heap over-read when placed at the end of the
+input with < 2 bytes of payload.
+
+IMPACT:
+- Information Disclosure: Adjacent heap memory contents may be read and potentially
+  influence decoder state (e.g., the read value becomes s->restart_interval or a
+  marker length, which controls subsequent processing).
+- Denial of Service: If the heap over-read accesses an unmapped memory page, the
+  process crashes with SIGSEGV.
+- The vulnerability is triggered by simply opening/decoding a malformed JPEG file.
+  Any application using FFmpeg's MJPEG decoder (ffmpeg, ffplay, ffprobe, or any
+  application linking libavcodec) is affected.
+
+TRIGGER CONDITION:
+A JPEG file containing a DRI marker (0xFF 0xDD) as the last bytes in the file,
+with no payload following the marker. Alternatively, any other marker type (SOF,
+DHT, DQT, SOS, COM, APP) at the end of the file with < 2 bytes of payload.
+
+SUGGESTED FIX:
+In mjpeg_decode_dri(), add a bounds check before the unsafe reads:
+
+    static int mjpeg_decode_dri(MJpegDecodeContext *s)
+    {
+    +   if (bytestream2_get_bytes_left(&s->gB) < 4)
+    +       return AVERROR_INVALIDDATA;
+        if (bytestream2_get_be16u(&s->gB) != 4)
+            return AVERROR_INVALIDDATA;
+        s->restart_interval = bytestream2_get_be16u(&s->gB);
+        ...
+    }
+
+In mjpeg_parse_len(), switch from the unsafe to the safe variant:
+
+    -   int len = bytestream2_get_be16u(&s->gB);
+    +   if (bytestream2_get_bytes_left(&s->gB) < 2)
+    +       return AVERROR_INVALIDDATA;
+    +   int len = bytestream2_get_be16(&s->gB);
+
+AFFECTED VERSIONS:
+Current FFmpeg master (commit 0ddece40c5 and prior). The vulnerable code pattern
+has been present since the initial implementation of the MJPEG decoder.

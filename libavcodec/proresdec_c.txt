@@ -1,0 +1,102 @@
+Vulnerability: Heap Buffer Over-Read in unpack_alpha() (libavcodec/proresdec.c)
+
+Severity: HIGH (CVSS ~7.1 - Heap OOB read, potential info leak / DoS)
+
+File: libavcodec/proresdec.c
+Functions: unpack_alpha() (line 52), decode_slice_alpha() (line 609)
+
+== Summary ==
+
+The unpack_alpha() function in the ProRes decoder performs unbounded bitstream
+reads past the end of the allocated buffer when the bitstream is exhausted
+before all alpha coefficients are filled. This results in a heap buffer
+over-read of up to ~6-8KB past the bitstream buffer, far exceeding the
+64-byte AV_INPUT_BUFFER_PADDING_SIZE guarantee.
+
+== Root Cause ==
+
+In unpack_alpha() (line 52-111), the inner do-while loop at line 60-87
+correctly checks for bitstream exhaustion:
+
+    } while (get_bits_left(gb)>0 && get_bits1(gb));  // line 87
+
+However, immediately after this loop exits (potentially due to
+get_bits_left(gb) <= 0), the code UNCONDITIONALLY reads more bits
+without any bounds check:
+
+    val = get_bits(gb, 4);         // line 88 - NO bounds check
+    if (!val)
+        val = get_bits(gb, 11);    // line 90 - NO bounds check
+
+The outer do-while loop (line 59-110) continues until idx >= num_coeffs.
+Each outer iteration reads at least ~20 bits from the bitstream via
+get_bits() calls. Since get_bits() reads from the buffer via
+UPDATE_CACHE_BE which does:
+
+    AV_RB32((gb)->buffer + (index >> 3))   // get_bits.h line 191-192
+
+...the index advances far past the buffer end, causing reads from
+heap memory well beyond the allocated bitstream buffer.
+
+== Attack Surface ==
+
+The vulnerability is triggered via decode_slice_alpha() (line 609) which
+is called from decode_slice_thread() (line 731-735) when:
+  1. ctx->alpha_info is non-zero (alpha channel present in frame header)
+  2. a_data_size > 0 (alpha data present in slice)
+
+The attacker controls:
+  - Alpha bitstream content and size (a_data_size) via crafted slice data
+  - Number of coefficients via slice->mb_count (up to 8 macroblocks)
+  - Alpha mode (8-bit or 16-bit) via alpha_info field
+
+== Over-Read Calculation ==
+
+With blocks_per_slice = 8 (maximum), num_coeffs = 8 * 4 * 64 = 2048.
+With minimal alpha data (e.g., 1 byte), almost all 2048 coefficients
+must be filled by reading from exhausted bitstream / padding / beyond.
+
+Per outer loop iteration (worst case, 16-bit alpha mode):
+  - Inner do-while: get_bits1 (1 bit) + get_bits(gb, 7) = 8 bits
+  - After inner loop: get_bits(gb, 4) + get_bits(gb, 11) = 15 bits
+  - Total: ~23 bits per iteration, idx increments by ~1
+
+Total reads past buffer: ~2048 * 23 = ~47,104 bits = ~5,888 bytes
+AV_INPUT_BUFFER_PADDING_SIZE = 64 bytes
+Over-read beyond padding: ~5,824 bytes of heap memory
+
+== Impact ==
+
+1. Information Disclosure: Heap memory contents are read and stored into
+   the alpha coefficient buffer (blocks[]), then written to the output
+   frame via memcpy at lines 632-636. This can leak heap data into the
+   decoded video frame output, accessible to the attacker.
+
+2. Denial of Service: Reading from unmapped heap memory can cause a
+   segmentation fault, crashing the application (ffmpeg, ffplay, or
+   any application using libavcodec for ProRes decoding).
+
+3. The vulnerability is reachable by opening any crafted .mov/.mxf file
+   containing ProRes video with alpha channel, making it exploitable
+   via media players, video transcoders, web services, etc.
+
+== Suggested Fix ==
+
+Add a get_bits_left() check before the unconditional get_bits() calls
+after the inner loop, and break out of the outer loop if the bitstream
+is exhausted:
+
+    } while (get_bits_left(gb)>0 && get_bits1(gb));
++   if (get_bits_left(gb) < 4)
++       break;
+    val = get_bits(gb, 4);
+    if (!val)
++   {
++       if (get_bits_left(gb) < 11)
++           break;
+        val = get_bits(gb, 11);
++   }
+
+This ensures the function terminates safely when the bitstream is
+exhausted, filling remaining coefficients with the last alpha value
+(which is the existing behavior for the fill loop).

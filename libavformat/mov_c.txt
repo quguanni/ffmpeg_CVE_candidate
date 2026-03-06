@@ -1,0 +1,93 @@
+Vulnerability: Integer Underflow in mov_read_iinf() leading to Heap-Based Buffer Over-Read / Denial of Service
+
+File: libavformat/mov.c
+Function: mov_read_iinf()
+Line: 9139
+Severity: HIGH (CVSS ~7.5)
+Type: CWE-191 (Integer Underflow), CWE-122 (Heap-Based Buffer Overflow), CWE-400 (Uncontrolled Resource Consumption)
+
+=== DESCRIPTION ===
+
+An integer underflow vulnerability exists in the mov_read_iinf() function in
+libavformat/mov.c at line 9139 when parsing HEIF/AVIF image container files.
+
+The vulnerable code:
+
+    for (i = 0; i < entry_count; i++) {
+        MOVAtom infe;
+
+        infe.size = avio_rb32(pb) - 8;   // LINE 9139 - INTEGER UNDERFLOW
+        infe.type = avio_rl32(pb);
+        ...
+        ret = mov_read_infe(c, pb, infe);
+        ...
+    }
+
+avio_rb32(pb) returns an unsigned 32-bit integer representing the size field of
+a child 'infe' atom within an 'iinf' box. The code subtracts 8 (for the size
+and type header fields) from this value.
+
+When avio_rb32(pb) returns a value less than 8 (i.e., 0 through 7), the
+subtraction wraps around in unsigned 32-bit arithmetic:
+
+    0u - 8u = 0xFFFFFFF8 = 4294967288
+
+This unsigned int result is then implicitly widened to int64_t (the type of
+MOVAtom.size), producing a large POSITIVE value (4294967288).
+
+=== IMPACT ===
+
+This corrupted size value is passed to mov_read_infe() as atom.size. Inside
+mov_read_infe(), the size is used to control how much data is read:
+
+1. The size validation checks at lines 9047 and 9060 pass because the
+   underflowed value (~4GB) is positive and large:
+     - "if (size < 0)" -> FALSE (size is ~4GB, positive)
+     - "if (size < 1)" -> FALSE
+
+2. ff_read_string_to_bprint_overwrite(pb, &item_name, size) is called at line
+   9064 with size ≈ 4294967276. This function reads bytes one at a time from the
+   stream until a null terminator is found OR up to ~4GB bytes are consumed.
+
+Consequences:
+  - Denial of Service: Excessive heap allocation (~4GB) via av_bprint dynamic
+    growth, leading to OOM crashes.
+  - Heap Over-Read: Data from beyond the atom boundary (and potentially beyond
+    the file data) is read into the heap buffer, causing information disclosure.
+  - Parser State Corruption: The stream read position advances far beyond the
+    current atom, corrupting subsequent parsing. This can lead to type confusion
+    and further exploitation in downstream atom parsers.
+  - On 32-bit systems, the large allocation size can cause additional integer
+    overflow issues in memory allocators.
+
+=== ROOT CAUSE ===
+
+The subtraction `avio_rb32(pb) - 8` is performed in unsigned 32-bit arithmetic
+without first checking that the value returned by avio_rb32() is >= 8. The
+result is then widened to int64_t, preserving the wrapped-around value as a
+large positive number rather than a negative one.
+
+=== FIX ===
+
+Add a bounds check before the subtraction:
+
+    uint32_t infe_raw_size = avio_rb32(pb);
+    if (infe_raw_size < 8) {
+        ret = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+    infe.size = infe_raw_size - 8;
+
+=== AFFECTED VERSIONS ===
+
+All FFmpeg versions that support HEIF/AVIF parsing via the iinf atom handler
+in libavformat/mov.c are affected. The vulnerable code was introduced when
+HEIF/AVIF support was added.
+
+=== REPRODUCTION ===
+
+See mov_c_PoC.txt for a Python script that generates a minimal malicious
+HEIF file triggering this vulnerability.
+
+Trigger: ffmpeg -i malicious.heif -f null -
+or:      ffprobe malicious.heif

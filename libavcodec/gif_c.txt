@@ -1,0 +1,98 @@
+Vulnerability: Integer Overflow in GIF Encoder Leading to Heap Buffer Overflow
+File: libavcodec/gif.c
+Severity: HIGH (Heap Buffer Overflow via Integer Overflow)
+
+================================================================================
+SUMMARY
+================================================================================
+
+Multiple integer overflow vulnerabilities exist in the FFmpeg GIF encoder
+(libavcodec/gif.c) when handling large image dimensions. The encoder permits
+dimensions up to 65535x65535 but performs arithmetic on width*height using
+32-bit signed int, which overflows for large dimensions. This results in
+critically undersized buffer allocations, leading to heap buffer overflows
+during LZW encoding and packet writing.
+
+================================================================================
+ROOT CAUSE
+================================================================================
+
+1) gif_encode_init() at line 463:
+
+    s->buf_size = avctx->width * avctx->height * 2 + 1000;
+
+   avctx->width and avctx->height are both int (32-bit signed). The dimension
+   validation at lines 455-458 only checks that each dimension is <= 65535,
+   but does NOT check for overflow in their product.
+
+   When width=65535 and height=32769:
+     - width * height = 65535 * 32769 = 2,147,483,647 (exactly INT_MAX)
+     - This value * 2 = 4,294,967,294 which overflows signed int to -2
+     - Adding 1000 gives buf_size = 998
+
+   So av_malloc(998) is called, allocating a 998-byte buffer for what should
+   be a ~4 GB buffer. The subsequent LZW encoding (ff_lzw_encode) writes
+   into s->buf far beyond its allocated size — a massive heap buffer overflow.
+
+2) gif_encode_frame() at line 483:
+
+    ff_alloc_packet(avctx, pkt, avctx->width*avctx->height*7/5 + FF_INPUT_BUFFER_MIN_SIZE)
+
+   Same integer overflow pattern. The packet allocation size computation
+   overflows, allocating a packet far too small for the encoded data.
+   The subsequent bytestream_put_* calls write past the end of pkt->data.
+
+3) gif_image_write_image() at line 405:
+
+    s->shrunk_buf = av_malloc(avctx->height * linesize);
+
+   avctx->height * linesize can also overflow for large dimensions, resulting
+   in an undersized allocation. remap_frame_to_palette() then writes
+   width*height bytes into this undersized buffer.
+
+================================================================================
+EXPLOITABLE DIMENSION RANGES
+================================================================================
+
+The overflow in buf_size is exploitable when width*height falls in the range
+[2,147,483,148 .. 2,147,483,647] (i.e., close to INT_MAX). In this range:
+
+  - width * height does NOT overflow (fits in int)
+  - width * height * 2 OVERFLOWS to a small negative value
+  - Adding 1000 yields a small POSITIVE buf_size (0 to 998)
+  - av_malloc succeeds with a tiny allocation
+  - LZW encoding writes ~2 GB of data into this tiny buffer
+
+Concrete example: width=65535, height=32769
+  - width * height = 2,147,483,647 (INT_MAX)
+  - buf_size = 998 (after overflow)
+  - Actual data written: ~2 GB → heap buffer overflow
+
+================================================================================
+IMPACT
+================================================================================
+
+- Heap buffer overflow with attacker-controlled size and content
+- Potential for arbitrary code execution
+- Denial of service (crash)
+- Triggered when encoding a crafted large-dimension image to GIF format
+- Affects any application using FFmpeg's GIF encoder with user-supplied
+  dimensions (e.g., transcoding pipelines, video processing services)
+
+================================================================================
+SUGGESTED FIX
+================================================================================
+
+Add overflow-safe dimension checks in gif_encode_init():
+
+    if ((int64_t)avctx->width * avctx->height > INT_MAX / 2 - 500) {
+        av_log(avctx, AV_LOG_ERROR, "GIF dimensions too large\n");
+        return AVERROR(EINVAL);
+    }
+
+Or use 64-bit arithmetic for all size computations:
+
+    s->buf_size = (int64_t)avctx->width * avctx->height * 2 + 1000;
+    // ... and check s->buf_size fits in size_t / doesn't exceed a reasonable max
+
+Similarly fix the ff_alloc_packet call and shrunk_buf allocation.

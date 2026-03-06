@@ -1,0 +1,95 @@
+Vulnerability: Heap Buffer Overflow in decode_adpcm_ima_hvqm4() (libavcodec/adpcm.c)
+======================================================================================
+
+Type: Heap Buffer Overflow (CWE-122)
+Severity: HIGH
+Location: libavcodec/adpcm.c, function decode_adpcm_ima_hvqm4(), lines 619-660
+
+Summary:
+--------
+A 1-sample (2-byte) heap buffer overflow exists in the ADPCM IMA HVQM4 decoder
+when processing mono audio with frame_format 1 or 3. An attacker can trigger
+this by supplying a crafted HVQM4 media file, potentially achieving code
+execution.
+
+Root Cause:
+-----------
+The bug is an off-by-one error caused by a mismatch between the buffer size
+calculation in get_nb_samples() and the actual number of samples written by
+decode_adpcm_ima_hvqm4().
+
+1. In get_nb_samples() (line 1258), nb_samples is computed as:
+
+       nb_samples = (buf_size - skip) * 2 / ch;
+
+   For mono (ch=1), this always produces an EVEN number (due to "* 2").
+
+2. In decode_adpcm_ima_hvqm4() (lines 646-650), when frame_format is 1 or 3:
+
+       if (frame_format == 1 || frame_format == 3) {
+           for (int ch = 0; ch < nb_channels; ch++)
+               *outbuf++ = (int16_t)c->status[st - ch].predictor;
+           samples_to_do--;    // <-- decremented ONCE regardless of channel count
+       }
+
+   For mono (1 channel): 1 initial sample is written, and samples_to_do is
+   decremented once, making it ODD (even - 1).
+
+3. The main decode loop (line 652):
+
+       for (int i = 0; i < samples_to_do; i += 1+(!st)) {
+           *outbuf++ = ...;    // write sample 1
+           *outbuf++ = ...;    // write sample 2
+       }
+
+   For mono (st=0), the step is 2 (since 1+(!0) = 2). Each iteration writes
+   2 samples. With an ODD samples_to_do, the loop runs ceil(samples_to_do/2)
+   iterations, writing samples_to_do + 1 samples total.
+
+4. Total samples written: 1 (initial) + (nb_samples - 1 + 1) = nb_samples + 1
+   Buffer capacity: nb_samples
+   Overflow: 1 int16_t = 2 bytes past the end of the heap-allocated audio frame
+
+Worked Example:
+---------------
+- Mono HVQM4 audio, frame_format = 1, buf_size = 10
+- skip = 6 + 2*1 = 8
+- nb_samples = (10 - 8) * 2 / 1 = 4
+- Buffer allocated: 4 * sizeof(int16_t) = 8 bytes
+- Initial sample write: 1 sample, samples_to_do = 4 - 1 = 3
+- Loop iterations: i=0 (0<3, write 2), i=2 (2<3, write 2) → 4 samples
+- Total writes: 1 + 4 = 5 samples → OVERFLOW by 1 sample (2 bytes)
+
+Impact:
+-------
+The 2-byte heap overflow can corrupt heap metadata or adjacent allocations.
+Depending on the heap layout, this can lead to:
+- Denial of Service (crash)
+- Potential arbitrary code execution via heap corruption
+
+The vulnerability is triggered by processing a crafted media file and requires
+no user interaction beyond opening/playing the file.
+
+Affected Code Path:
+--------------------
+adpcm_decode_frame()  [line 1441]
+  → get_nb_samples()  [line 1248, ADPCM_IMA_HVQM4 case]
+  → ff_get_buffer()   [line 1463, allocates buffer for nb_samples]
+  → decode_adpcm_ima_hvqm4()  [line 1899, writes nb_samples + 1 for mono fmt 1/3]
+
+Suggested Fix:
+--------------
+In decode_adpcm_ima_hvqm4(), decrement samples_to_do once PER CHANNEL
+(inside the for loop), not once after it:
+
+    if (frame_format == 1 || frame_format == 3) {
+        for (int ch = 0; ch < avctx->ch_layout.nb_channels; ch++) {
+            *outbuf++ = (int16_t)c->status[st - ch].predictor;
+-       }
+-       samples_to_do--;
++           samples_to_do--;
++       }
+    }
+
+Alternatively, in get_nb_samples(), ensure nb_samples accounts for the
+initial samples and aligns correctly with the loop's step size for mono.

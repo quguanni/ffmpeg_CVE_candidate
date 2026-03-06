@@ -1,0 +1,117 @@
+VULNERABILITY: Heap Buffer Over-Read in mpeg4_decode_block() via UNCHECKED_BITSTREAM_READER
+================================================================================
+
+File: libavcodec/mpeg4videodec.c
+Severity: HIGH (CVSS ~7.5)
+Type: CWE-125 (Out-of-bounds Read) / CWE-126 (Buffer Over-read)
+
+SUMMARY
+-------
+The file defines UNCHECKED_BITSTREAM_READER 1 at line 23, globally disabling all
+bounds checking on bitstream read operations (get_bits, show_bits, skip_bits, etc.).
+The mpeg4_decode_block() function (line 1381) contains a complex VLC decoding loop
+with multiple escape code paths that can read far beyond the allocated bitstream
+buffer and its AV_INPUT_BUFFER_PADDING_SIZE (64-byte) safety padding. The over-read
+data is then used as indices into VLC and run-level lookup tables, amplifying the
+over-read into secondary out-of-bounds table accesses.
+
+ROOT CAUSE
+----------
+Line 23:
+    #define UNCHECKED_BITSTREAM_READER 1
+
+This disables the bounds check in get_bits.h that normally prevents reading past
+the end of the bitstream buffer. All bitstream reads in the file become unchecked.
+
+VULNERABLE CODE PATH
+--------------------
+mpeg4_decode_block() lines 1466-1631 — the inner AC coefficient VLC decoding loop:
+
+1. The loop iterates up to 64 times (once per AC coefficient in an 8x8 block).
+
+2. The THIRD ESCAPE code path (lines 1518-1549) reads at minimum 23 bits per
+   iteration without any get_bits_left() check:
+     - 2 bits (escape prefix)
+     - 1 bit (last flag)
+     - 6 bits (run value)
+     - 1 bit (marker)
+     - 12 bits (level value)
+     - 1 bit (marker)
+   Total worst case across 64 iterations: ~1472 bits = 184 bytes past valid data.
+   This far exceeds the 64-byte AV_INPUT_BUFFER_PADDING_SIZE.
+
+3. The SECOND ESCAPE code path (line 1594-1599) uses over-read data in a
+   secondary table lookup:
+     GET_RL_VLC(level, run, re, &h->gb, rl_vlc, TEX_VLC_BITS, 2, 1);
+     i += run + rl->max_run[run >> 7][level / qmul] + 1;
+
+   Here, 'level' decoded from garbage over-read data produces an arbitrary value.
+   'level / qmul' is used as an index into rl->max_run[] without bounds checking.
+   The max_run array has only MAX_LEVEL+1 entries (~128). A garbage level value
+   can cause level/qmul to exceed this, producing an out-of-bounds read on the
+   max_run lookup table — a secondary heap over-read.
+
+4. Similarly, in the FIRST ESCAPE (line 1603-1606):
+     GET_RL_VLC(level, run, re, &h->gb, rl_vlc, TEX_VLC_BITS, 2, 1);
+     level = level + rl->max_level[run >> 7][(run - 1) & 63] * qmul;
+
+   The (run-1) & 63 mask bounds this particular index, but the initial VLC
+   table lookup itself (via rl_vlc pointer) is still performed on over-read data.
+
+TRIGGER CONDITION
+-----------------
+A crafted MPEG-4 bitstream that:
+  1. Contains a valid VOL header and VOP header (to pass header parsing)
+  2. Begins encoding a macroblock with coded AC coefficients (cbp != 0)
+  3. Is truncated mid-block, forcing the VLC decoder to read past the buffer
+
+The vulnerability is reachable from any MPEG-4 input (local file, network stream,
+embedded video) processed by ffmpeg's mpeg4 decoder.
+
+IMPACT
+------
+- Information Disclosure: Reading adjacent heap memory can leak sensitive data
+  (encryption keys, other decoded frames, user data) through the decoded video
+  output, as the garbage values are written into the block coefficients and
+  subsequently processed by the IDCT into visible pixel data.
+
+- Denial of Service: If the over-read reaches unmapped memory pages, the process
+  crashes with SIGSEGV.
+
+- Secondary OOB reads on VLC/run-level tables can further amplify the over-read
+  and access arbitrary heap offsets.
+
+AFFECTED FUNCTIONS
+------------------
+Primary:  mpeg4_decode_block()       — lines 1381-1648
+          mpeg4_decode_mb()          — lines 1741-2117 (calls mpeg4_decode_block)
+          mpeg4_decode_partitioned_mb() — line 1654 (calls mpeg4_decode_block)
+
+Secondary (also affected by UNCHECKED_BITSTREAM_READER):
+          mpeg4_decode_sprite_trajectory() — line 437
+          decode_vop_header()              — line 3068
+          mpeg4_decode_partition_a()       — line 1031
+          decode_vol_header()              — line 2641
+
+PROPOSED FIX
+------------
+Option A (targeted): Add get_bits_left() checks inside the VLC decoding loop
+in mpeg4_decode_block(), at minimum before each UPDATE_CACHE / GET_RL_VLC call:
+
+    if (get_bits_left(&h->gb) < 1) {
+        av_log(h->c.avctx, AV_LOG_ERROR, "bitstream truncated in block decode\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+Option B (comprehensive): Remove or change line 23 to:
+    #define UNCHECKED_BITSTREAM_READER 0
+
+This re-enables bounds checking for all bitstream reads in the file. Performance
+impact is minimal on modern CPUs with branch prediction.
+
+REFERENCES
+----------
+- libavcodec/get_bits.h: UNCHECKED_BITSTREAM_READER mechanism
+- AV_INPUT_BUFFER_PADDING_SIZE defined as 64 bytes (libavutil/avcodec.h)
+- Similar historical CVEs: CVE-2022-3109 (ffmpeg null ptr via crafted mpeg4),
+  CVE-2018-15822 (ffmpeg flac unchecked bitstream reader)

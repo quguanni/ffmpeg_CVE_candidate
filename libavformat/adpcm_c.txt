@@ -1,0 +1,83 @@
+Vulnerability: Heap Buffer Overflow in ADPCM_MS Decoder (libavcodec/adpcm.c)
+=============================================================================
+
+Type: Heap Buffer Overflow (Out-of-Bounds Write and Out-of-Bounds Read)
+Severity: Critical (CVSS ~8.8 - Remote Code Execution potential)
+Component: libavcodec/adpcm.c, ADPCM_MS decoder
+Affected function: adpcm_decode_frame() via get_nb_samples()
+
+Root Cause
+----------
+In get_nb_samples() at line 1347, the output sample count for ADPCM_MS is
+calculated as:
+
+    nb_samples = (buf_size - 6 * ch) * 2 / ch;
+
+This subtracts 6 bytes per channel for the header. However, the actual MS ADPCM
+block header requires **7 bytes per channel**:
+
+  - block_predictor:  1 byte   (bytestream2_get_byteu, line 1639/1659)
+  - idelta:           2 bytes  (bytestream2_get_le16u, line 1647/1677)
+  - sample1:          2 bytes  (bytestream2_get_le16u, line 1648/1682)
+  - sample2:          2 bytes  (bytestream2_get_le16u, line 1649/1684)
+  Total per channel:  7 bytes
+
+The off-by-one error (6 vs 7 bytes per channel) means the formula yields
+nb_samples = 1 for packets that are too small to contain even a complete header.
+
+Consequence: Heap Buffer Overflow (Write)
+-----------------------------------------
+After get_nb_samples() returns nb_samples = 1, the output buffer is allocated
+with room for only 1 sample per channel. However, the decoder unconditionally
+writes BOTH sample1 and sample2 per channel (2 samples per channel) into the
+output buffer at lines 1650-1651 (multichannel path) and 1687-1690 (stereo
+path), regardless of nb_samples.
+
+For stereo (ch=2) with buf_size=13:
+  - nb_samples = (13 - 12) * 2 / 2 = 1
+  - Output buffer: 1 sample * 2 channels * 2 bytes = 4 bytes (interleaved S16)
+  - Header writes: sample2[0], sample2[1], sample1[0], sample1[1] = 4 int16 = 8 bytes
+  - OVERFLOW: 4 bytes written past the end of the 4-byte output buffer
+
+For 3 channels with buf_size=20:
+  - nb_samples = (20 - 18) * 2 / 3 = 1
+  - Output buffer: 1 sample per channel * 2 bytes = 2 bytes per channel (S16P)
+  - Header writes: 2 int16 per channel = 4 bytes per channel
+  - OVERFLOW: 2 bytes written past the end of each channel's 2-byte buffer
+
+Consequence: Heap Buffer Over-Read
+-----------------------------------
+The header also reads more bytes from the input than are available, using
+unchecked bytestream2_get_*u() accessors that do NOT perform bounds checking:
+
+For stereo, buf_size=13:
+  - Header reads: 2*1 (predictors) + 2*2 (ideltas) + 2*2 (sample1s) + 2*2 (sample2s) = 14 bytes
+  - Available: 13 bytes
+  - OVER-READ: 1 byte past the input buffer
+
+Exploitation
+------------
+An attacker can craft a media file (e.g., WAV, AVI, or any container supporting
+ADPCM MS audio) with:
+  1. Audio codec set to ADPCM MS (format tag 0x0002)
+  2. 2 or more audio channels
+  3. A small block_align or packet size (e.g., 13 bytes for stereo)
+
+When FFmpeg decodes this file, the heap buffer overflow occurs, potentially
+allowing:
+  - Denial of Service (crash via heap corruption)
+  - Remote Code Execution (by controlling heap layout and overwritten data)
+
+No user interaction beyond opening the file is required.
+
+Fix
+---
+Change line 1347 from:
+    nb_samples = (buf_size - 6 * ch) * 2 / ch;
+to:
+    nb_samples = (buf_size - 7 * ch) * 2 / ch + 2;
+
+Or equivalently, add a minimum buffer size check:
+    if (buf_size < 7 * ch)
+        return 0;
+    nb_samples = (buf_size - 7 * ch) * 2 / ch + 2;

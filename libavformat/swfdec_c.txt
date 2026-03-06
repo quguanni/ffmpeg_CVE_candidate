@@ -1,0 +1,210 @@
+Vulnerability: Missing Tag Length Validation in SWF Tag Handlers Causes Stream
+Desynchronization Leading to Heap-Based Out-of-Bounds Read
+
+Severity: HIGH (CVSS ~7.5 - Heap-based OOB read, DoS, potential info leak)
+
+File: libavformat/swfdec.c
+Function: swf_read_packet()
+Lines: 213-551
+
+==============================================================================
+ROOT CAUSE
+==============================================================================
+
+In swf_read_packet(), multiple SWF tag handlers consume bytes from the stream
+via avio_rl16/avio_r8/avio_rl32 WITHOUT first validating that the tag's content
+length (`len`) is sufficient for the expected header fields. When a crafted SWF
+provides a tag with a truncated length, the reads spill past the tag boundary
+into the data of subsequent tags. Since the main parsing loop is `for(;;)`
+(line 225), the desynchronized parser continues processing, interpreting
+attacker-controlled bytes as new tag headers with attacker-controlled lengths.
+
+PRIMARY VULNERABLE PATH - TAG_VIDEOSTREAM (lines 234-256):
+
+    } else if (tag == TAG_VIDEOSTREAM) {
+        int ch_id = avio_rl16(pb);     // reads 2 bytes
+        len -= 2;
+
+        for (i=0; i<s->nb_streams; i++) {
+            st = s->streams[i];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && st->id == ch_id)
+                goto skip;
+        }
+
+        avio_rl16(pb);                 // reads 2 bytes
+        avio_rl16(pb);                 // reads 2 bytes
+        avio_rl16(pb);                 // reads 2 bytes
+        avio_r8(pb);                   // reads 1 byte
+        /* codec tag */
+        avio_r8(pb);                   // reads 1 byte
+        avpriv_set_pts_info(vst, 16, 256, swf->frame_rate);
+        len -= 8;
+
+Total: 10 bytes consumed, len decremented by 10. NO CHECK that len >= 10.
+
+When original len < 10 and no matching stream exists (first occurrence of
+this ch_id), the code reads (10 - len) bytes from subsequent tag data.
+At the `skip:` label (line 546):
+
+    skip:
+        if(len<0)
+            av_log(s, AV_LOG_WARNING, "Clipping len %d\n", len);
+        len = FFMAX(0, len);       // <-- negative len clamped to 0
+        avio_skip(pb, len);        // <-- skips 0 bytes, does NOT compensate
+
+The (10 - original_len) bytes consumed from subsequent tags are permanently
+lost, and the for(;;) loop continues, calling get_swf_tag() at a misaligned
+stream position. The attacker controls what bytes are at this position,
+thus controlling the next tag type and length.
+
+ADDITIONAL VULNERABLE TAG HANDLERS (same pattern):
+
+- TAG_STREAMHEAD/TAG_STREAMHEAD2 (lines 257-272): Reads 4 bytes without
+  checking len >= 4. Desync of up to 4 bytes.
+
+- TAG_DEFINESOUND (lines 273-300): Reads 7 bytes minimum (or 9 for MP3)
+  without checking len >= 7. Desync of up to 9 bytes.
+
+- TAG_STREAMBLOCK with MP3 (lines 478-480): Calls avio_skip(pb, 4) without
+  checking len >= 4. Desync of up to 4 bytes.
+
+- TAG_DEFINEBITSLOSSLESS (lines 328-370): Reads 7-8 bytes without checking
+  len >= 8. Desync of up to 8 bytes.
+
+==============================================================================
+IMPACT
+==============================================================================
+
+1. HEAP-BASED OUT-OF-BOUNDS READ: After desynchronization, get_swf_tag()
+   interprets attacker-controlled bytes as a tag header. The length field
+   (especially in long-form tags where len = avio_rl32) can be set to any
+   value up to INT_MAX. This length is then passed to av_get_packet() or
+   av_new_packet() in subsequent tag handlers (e.g., TAG_JPEG2 at line 516,
+   TAG_DEFINESOUND at line 296, TAG_STREAMBLOCK at line 483), causing reads
+   far beyond the actual file data. For buffered/memory-mapped inputs, this
+   reads adjacent heap memory.
+
+2. CASCADING PARSER STATE CORRUPTION: The for(;;) loop continues after
+   desync, and each subsequent misaligned tag parse can cause further
+   desynchronization, amplifying the attacker's control over the parser
+   state. Multiple streams can be created with attacker-controlled codec
+   parameters, which are passed to downstream decoders.
+
+3. DENIAL OF SERVICE: An attacker-controlled length field causes allocation
+   of large buffers via av_new_packet(). Repeated desync in the for(;;)
+   loop can trigger multiple large allocations, leading to OOM. With
+   TAG_JPEG2, a single desync can cause allocation up to ~2GB.
+
+4. INFORMATION DISCLOSURE: When av_get_packet() reads past the end of file
+   data into previously-freed heap memory (in buffered IO mode), the
+   resulting packet contains stale heap contents. This packet is returned
+   to the caller and may be processed by downstream decoders, potentially
+   exposing sensitive data in transcoding or streaming pipelines.
+
+5. The vulnerability is triggered during normal demuxing (swf_read_packet),
+   requiring no special flags or options. Simply opening a crafted .swf file
+   with ffmpeg/ffprobe or any application using libavformat triggers it.
+
+==============================================================================
+ATTACK SCENARIO
+==============================================================================
+
+Construct an SWF file with:
+  - Valid FWS header (uncompressed SWF, avoids zlib dependency)
+  - A TAG_VIDEOSTREAM tag with short-form length = 4 (only 4 content bytes,
+    but the handler tries to read 10)
+  - Following bytes crafted so that after the 6-byte desync, get_swf_tag()
+    reads a TAG_JPEG2 (tag=21) with a large long-form length
+
+Execution flow:
+  1. get_swf_tag() returns tag=TAG_VIDEOSTREAM(60), len=4
+  2. ch_id = avio_rl16(pb): reads 2 bytes from tag, len -= 2 -> len = 2
+  3. No matching stream found (first occurrence)
+  4. avio_rl16 x3 + avio_r8 x2: reads 8 bytes, but only 2 remain in tag
+     -> 6 bytes consumed from next data, len -= 8 -> len = -6
+  5. skip: len = max(0, -6) = 0, avio_skip(pb, 0). Stream desynchronized
+     by 6 bytes.
+  6. for(;;) continues. get_swf_tag() reads from desynchronized position.
+  7. Attacker-crafted bytes at this position form tag=TAG_JPEG2 with
+     long-form length (0x3f -> read 4-byte length = 0x00100000 = 1MB)
+  8. TAG_JPEG2 handler: av_new_packet(pkt, 1MB) allocates 1MB buffer
+  9. avio_read(pb, pkt->data, 4) reads 4 bytes. If file is shorter than
+     expected, remaining packet data contains uninitialized heap memory.
+  10. Packet with heap data is returned to caller -> info leak / decoder
+      confusion.
+
+==============================================================================
+SECONDARY VULNERABILITY: Signed Integer Overflow in DEFINEBITSLOSSLESS2
+==============================================================================
+
+File: libavformat/swfdec.c, line 437
+
+In the TAG_DEFINEBITSLOSSLESS2 handler for PAL-8 bitmaps (bmp_fmt == 3):
+
+    for (i = 0; i < colormapsize; i++)
+        if (alpha_bmp)  colormap[i] = buf[3]<<24 | AV_RB24(buf + 4*i);
+
+Two bugs in this line:
+
+(a) SIGNED INTEGER OVERFLOW (UB): buf[3] is uint8_t, promoted to int for
+    the shift. When buf[3] >= 0x80 (128), buf[3]<<24 produces a value
+    exceeding INT_MAX (2^31-1), causing signed integer overflow which is
+    UNDEFINED BEHAVIOR in C. On some architectures/compilers this can
+    produce incorrect results or be optimized in unexpected ways.
+
+(b) WRONG INDEX: buf[3] reads the alpha byte of only the FIRST colormap
+    entry for ALL entries. The correct expression is buf[4*i+3]. This
+    causes all palette entries to share entry 0's alpha value, corrupting
+    transparency rendering and potentially masking other visual data.
+
+==============================================================================
+FIX
+==============================================================================
+
+Add length validation before reading tag contents in each handler:
+
+    } else if (tag == TAG_VIDEOSTREAM) {
++       if (len < 10) {
++           av_log(s, AV_LOG_ERROR, "TAG_VIDEOSTREAM too short: %d\n", len);
++           goto skip;
++       }
+        int ch_id = avio_rl16(pb);
+        len -= 2;
+        ...
+
+    } else if (tag == TAG_STREAMHEAD || tag == TAG_STREAMHEAD2) {
++       if (len < 4) {
++           av_log(s, AV_LOG_ERROR, "TAG_STREAMHEAD too short: %d\n", len);
++           goto skip;
++       }
+        ...
+
+    } else if (tag == TAG_DEFINESOUND) {
++       if (len < 7) {
++           av_log(s, AV_LOG_ERROR, "TAG_DEFINESOUND too short: %d\n", len);
++           goto skip;
++       }
+        ...
+
+    } else if (tag == TAG_STREAMBLOCK) {
+        for (i = 0; i < s->nb_streams; i++) {
+            ...
+            if (...) {
+                if (st->codecpar->codec_id == AV_CODEC_ID_MP3) {
++                   if (len < 4)
++                       goto skip;
+                    avio_skip(pb, 4);
+                    len -= 4;
+                    ...
+
+    } else if (tag == TAG_DEFINEBITSLOSSLESS || ...) {
++       if (len < 7) {
++           av_log(s, AV_LOG_ERROR, "TAG_DEFINEBITSLOSSLESS too short\n");
++           goto skip;
++       }
+        ...
+
+Fix for the alpha bug (line 437):
+
+-       if (alpha_bmp)  colormap[i] = buf[3]<<24 | AV_RB24(buf + 4*i);
++       if (alpha_bmp)  colormap[i] = (unsigned)buf[4*i+3]<<24 | AV_RB24(buf + 4*i);

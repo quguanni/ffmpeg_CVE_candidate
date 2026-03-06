@@ -1,0 +1,116 @@
+Vulnerability: Signed Integer Overflow leading to Undefined Behavior in lpc_prediction()
+
+File: libavcodec/alac.c
+Function: lpc_prediction() (lines 176-237) and rice_decompress() (lines 113-169)
+Severity: High
+Type: CWE-190 (Integer Overflow or Wraparound) / CWE-131 (Incorrect Calculation of Buffer Size)
+
+Summary:
+A signed integer overflow vulnerability exists in the LPC prediction accumulation
+loop of the ALAC (Apple Lossless Audio Codec) decoder. A crafted ALAC bitstream can
+trigger undefined behavior through controlled integer overflow, which modern
+compilers may exploit for aggressive optimizations that break safety assumptions,
+potentially leading to out-of-bounds memory access or arbitrary code execution.
+
+Root Cause:
+In lpc_prediction() at lines 218-219:
+
+    int val = 0;
+    for (j = 0; j < lpc_order; j++)
+        val += (pred[j] - d) * lpc_coefs[j];
+
+The variable `val` is a signed 32-bit integer. The loop accumulates up to 30
+products (lpc_order is a 5-bit field, max 30 excluding special value 31).
+Each term involves:
+  - pred[j] (uint32_t) - prediction buffer values influenced by prior decoding
+  - d (int, derived from uint32_t via implementation-defined conversion)
+  - lpc_coefs[j] (int16_t, range -32768 to +32767) - read directly from bitstream
+
+An attacker controls lpc_coefs[] through the bitstream (line 321:
+get_sbits(gb, 16)) and can influence pred[] values through crafted rice-coded
+prediction errors. With 30 terms each potentially contributing large values,
+the accumulation trivially overflows int32_t.
+
+The overflowed value is then used at line 220-222:
+
+    val = (val + (1LL << (lpc_quant - 1))) >> lpc_quant;
+    val += d + error_val;
+    buffer_out[i] = sign_extend(val, bps);
+
+The corrupted val is stored back into buffer_out[], which IS the prediction
+buffer (buffer_out aliases pred). On subsequent iterations, the corrupted
+value is read back as pred[j], creating a feedback loop that amplifies the
+overflow with each sample.
+
+Contributing Factor - Silent Error Clamping in rice_decompress():
+At lines 153-158:
+
+    if (block_size >= nb_samples - i) {
+        av_log(alac->avctx, AV_LOG_ERROR,
+               "invalid zero block size of %d %d %d\n", block_size,
+               nb_samples, i);
+        block_size = nb_samples - i - 1;
+    }
+
+When an invalid block_size is detected, instead of returning AVERROR_INVALIDDATA,
+the code silently clamps the value and continues processing. This allows an
+attacker to desynchronize the bitstream decoder: the rice decoder consumes the
+wrong number of zero-run elements, causing subsequent decode_scalar() calls to
+interpret arbitrary bitstream data as rice-coded prediction errors. These
+arbitrary values then feed into lpc_prediction(), giving the attacker further
+control over the overflow.
+
+Exploitation Scenario:
+1. Craft ALAC extradata with valid parameters (sample_size=32, channels=2,
+   max_samples_per_frame=4096)
+2. Craft a compressed frame element with:
+   - lpc_order = 30 (maximum non-special value)
+   - lpc_coefs[] set to maximum magnitude values (+32767 or -32767)
+   - lpc_quant = 1 (minimum, maximizes the magnitude of the shifted result)
+   - Rice-coded prediction errors designed to create large pred[] values
+3. The accumulation loop overflows on the first full prediction iteration
+4. The overflowed value feeds back into pred[], amplifying subsequent overflows
+5. Depending on compiler optimizations (-O2/-O3), the undefined behavior from
+   signed overflow may cause:
+   - Elision of subsequent bounds checks the compiler proves "cannot happen"
+     assuming no overflow
+   - Vectorized loop iterations that process incorrect element counts
+   - Miscompiled sign_extend() producing out-of-range values
+
+Additional Issue - Error Suppression in alac_decode_frame():
+At line 456-457:
+
+    ret = decode_element(avctx, frame, ..., channels);
+    if (ret < 0 && get_bits_left(&alac->gb))
+        return ret;
+
+Errors from decode_element are silently suppressed when the bitstream is
+exhausted (get_bits_left returns 0). While the subsequent !got_end check
+prevents returning an uninitialized frame in most cases, this error
+suppression pattern is fragile and could be bypassed with carefully
+positioned TYPE_END markers in the bitstream.
+
+Impact:
+- Denial of Service (crash) via undefined behavior
+- Potential arbitrary code execution depending on compiler optimizations
+- Information disclosure if partially-initialized frame data is returned
+
+Affected Versions:
+All versions of FFmpeg containing the ALAC decoder with the lpc_prediction
+function using signed int accumulation.
+
+Recommended Fix:
+1. Use int64_t for the accumulation variable in lpc_prediction():
+     int64_t val = 0;
+     for (j = 0; j < lpc_order; j++)
+         val += (int64_t)(pred[j] - d) * lpc_coefs[j];
+
+2. Return AVERROR_INVALIDDATA in rice_decompress() when block_size is invalid
+   instead of silently clamping:
+     if (block_size >= nb_samples - i)
+         return AVERROR_INVALIDDATA;
+
+3. Properly propagate errors in alac_decode_frame() regardless of
+   remaining bits:
+     if (ret < 0)
+         return ret;

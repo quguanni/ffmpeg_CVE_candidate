@@ -1,0 +1,88 @@
+Vulnerability: Integer Overflow in tiff_unpack_zlib Leading to Heap Buffer Over-Read
+File: libavcodec/tiff.c
+Severity: HIGH (CWE-190 Integer Overflow -> CWE-125 Out-of-Bounds Read)
+
+SUMMARY
+=======
+In tiff_unpack_zlib() at line 529, the buffer size calculation
+  outlen = width * lines;
+performs a signed 32-bit integer multiplication (both `width` and `lines`
+are `int`). When the product exceeds INT_MAX, signed integer overflow
+occurs (undefined behavior in C), and the result wraps to a small
+positive value. This causes av_malloc() to allocate a drastically
+undersized buffer. The subsequent line-copy loop then reads far past the
+end of this buffer, causing a heap buffer over-read.
+
+ROOT CAUSE
+==========
+File: libavcodec/tiff.c, line 529
+
+  static int tiff_unpack_zlib(..., int width, int lines, ...)
+  {
+      unsigned long outlen;
+      outlen = width * lines;        // <-- INTEGER OVERFLOW (int * int)
+      zbuf   = av_malloc(outlen);    // <-- undersized allocation
+      ...
+      // After zlib decompression:
+      for (line = 0; line < lines; line++) {
+          memcpy(dst, src, width);   // <-- reads past zbuf on later iterations
+          src += width;
+      }
+  }
+
+The multiplication `width * lines` is performed in `int` (signed 32-bit)
+arithmetic because both operands are `int`. The result is then implicitly
+widened to `unsigned long` for the assignment to `outlen`. If the true
+mathematical product exceeds 2^31-1, the signed multiplication overflows,
+producing a small positive value. This small value is used to allocate
+zbuf, but the loop iterates `lines` times reading `width` bytes each,
+for a total of `lines * width` bytes (the true, non-overflowed product).
+After exhausting the undersized zbuf, subsequent memcpy calls read from
+unallocated heap memory.
+
+Note: The LZMA equivalent (tiff_unpack_lzma at line 593) correctly
+handles this by casting to uint64_t BEFORE multiplication:
+  uint64_t outlen = width * (uint64_t)lines;
+This confirms the zlib path is a bug, not a design choice.
+
+TRIGGER CONDITIONS
+==================
+The attacker must craft a TIFF image with:
+1. Compression type = DEFLATE (tag 259 = 8 or 32946)
+2. Image width (W) and bits-per-pixel (BPP) such that:
+     byte_width = ((W * BPP) + 7) >> 3
+3. Height (H) / rows-per-strip (RPS) such that lines = min(RPS, H)
+4. byte_width * lines > 2^31 (to trigger overflow)
+5. byte_width * lines mod 2^32 is small and positive (for successful
+   malloc)
+6. W * H <= max_pixels (default INT_MAX) to pass dimension validation
+
+Concrete example:
+  - Width = 10, BPP = 24 (RGB24) => byte_width = 30
+  - Height = 143,165,577, RPS = 143,165,577 => lines = 143,165,577
+  - Pixel count = 10 * 143,165,577 = 1,431,655,770 < INT_MAX (passes)
+  - byte_width * lines = 30 * 143,165,577 = 4,294,967,310
+  - As int32: 4,294,967,310 - 2^32 = 14
+  - outlen = 14 => zbuf = 14 bytes allocated
+  - Loop reads 30 * 143,165,577 = ~4.3 GB from a 14-byte buffer
+
+IMPACT
+======
+- Heap buffer over-read: the memcpy loop reads gigabytes past the
+  allocated zbuf, copying heap contents into the decoded frame buffer.
+  This can leak sensitive information from process memory.
+- Denial of service: reading unmapped memory causes SIGSEGV.
+- The vulnerability is reachable by opening a crafted TIFF/DNG image
+  with any application using FFmpeg's TIFF decoder (ffmpeg, ffplay,
+  ffprobe, or any libavcodec consumer).
+
+FIX
+===
+Change line 529 from:
+    outlen = width * lines;
+to:
+    outlen = width * (unsigned long)lines;
+or, mirroring the LZMA fix:
+    outlen = width * (uint64_t)lines;
+An additional check that outlen doesn't exceed a reasonable maximum
+would further harden the code.

@@ -1,0 +1,131 @@
+VULNERABILITY: Heap Buffer Over-Read via Silent Error Propagation and
+Corrupted Reference Frame Reuse in RV60 Decoder (rv60dec.c)
+
+CWE-252 (Unchecked Return Value) + CWE-908 (Use of Uninitialized Resource)
+Severity: HIGH (CVSS ~7.5)
+Component: libavcodec/rv60dec.c — rv60_decode_frame(), decode_slice()
+
+========================================================================
+SUMMARY
+========================================================================
+
+In rv60_decode_frame() at line 2370, the return value of avctx->execute2()
+is unconditionally overwritten with `ret = 0`, silently discarding ALL
+decode errors from decode_slice(). When a crafted RV60 bitstream causes
+decode_slice() to fail mid-CU-row (e.g., via an invalid QP triggering the
+check at line 1795, an invalid intra prediction mode at line 1722, or a
+missing reference frame at line 1751), the partially-decoded frame is:
+
+  1) Output to the application as if decoding succeeded (lines 2371-2379)
+  2) Stored as a reference frame for subsequent P/B frames (lines 2381-2384)
+
+Because decode_cu_r() performs irreversible side effects — writing
+reconstruction metadata to pu_info/blk_info AND performing motion
+compensation writes directly to the frame buffer — BEFORE reaching the QP
+validation check at line 1795 (if (qp >= 32) return AVERROR_INVALIDDATA),
+the partially decoded frame contains a mix of valid decoded pixels and
+zero-initialized (from ff_get_buffer) data. When this frame is subsequently
+used as a reference by a P or B frame, the motion compensation code in mc()
+reads from these zero-initialized regions, which can lead to information
+disclosure if the frame buffer was recycled from a previous allocation that
+contained sensitive data.
+
+========================================================================
+ROOT CAUSE ANALYSIS
+========================================================================
+
+File: libavcodec/rv60dec.c
+
+1) SILENT ERROR DROPPING (line 2368-2370):
+
+    s->avctx->execute2(s->avctx, decode_slice,
+                        s->last_frame[CUR_PIC], NULL, s->cu_height);
+    ret = 0;  // <--- SILENTLY DISCARDS ALL DECODE ERRORS
+
+   The execute2() callback invokes decode_slice() for each CU row. If any
+   slice returns a negative error code (AVERROR_INVALIDDATA, etc.), this
+   error is silently lost. The application receives no indication that
+   decoding failed.
+
+2) SIDE EFFECTS BEFORE VALIDATION in decode_cu_r() (lines 1660-1917):
+
+   The function executes in this order:
+     a) Read CU/PU type and MV data from bitstream (lines 1683-1712)
+     b) reconstruct() — writes MV/PU metadata to shared arrays (line 1712)
+     c) Intra prediction or motion compensation — writes pixels to frame
+        (lines 1716-1783)
+     d) QP validation: if (qp >= 32) return AVERROR_INVALIDDATA (line 1795)
+     e) Coefficient decoding using qp/sel_qp (lines 1799-1913)
+
+   Steps (b) and (c) execute BEFORE the QP check at step (d). A crafted
+   bitstream with qp values in [32, 63] (valid per the slice-level check
+   at line 2269 which only requires qp < 64) causes decode_cu_r to write
+   reconstruction data and MC pixels to the frame, then return an error.
+
+3) CORRUPTED REFERENCE FRAME REUSE (lines 2381-2384):
+
+   For non-B frames, after the silent error drop:
+     av_frame_unref(s->last_frame[NEXT_PIC]);
+     FFSWAP(AVFrame *, s->last_frame[CUR_PIC], s->last_frame[NEXT_PIC]);
+
+   The partially-decoded CUR_PIC is promoted to NEXT_PIC, and on the next
+   non-B frame, swapped to LAST_PIC — becoming the primary reference for
+   all subsequent P-frame motion compensation.
+
+4) MISSING FRAME-LEVEL REFERENCE CHECK FOR two_f_refs P-FRAMES (line 2332):
+
+   if ((s->pict_type == AV_PICTURE_TYPE_P &&
+        !s->last_frame[LAST_PIC]->data[0]) || ...)
+
+   For P-frames with two_f_refs=1, MVREF_REF1 uses last_frame[NEXT_PIC],
+   but the frame-level check ONLY validates LAST_PIC. The per-CU check at
+   line 1755 catches this, but the error is silently dropped by execute2,
+   allowing the corrupted frame to propagate.
+
+========================================================================
+AFFECTED CODE PATHS
+========================================================================
+
+rv60_decode_frame() → execute2() → decode_slice() → decode_cu_r()
+  → reconstruct()           [writes to pu_info/blk_info - BEFORE qp check]
+  → mc()                    [writes to frame buffer - BEFORE qp check]
+  → if (qp >= 32) return .. [ERROR - but frame already partially written]
+
+The error propagates: decode_cu_r → decode_slice (break) → execute2 →
+rv60_decode_frame (ret = 0 — ERROR LOST) → frame used as output+reference
+
+========================================================================
+IMPACT
+========================================================================
+
+- Denial of Service: Application cannot detect decode failure, may exhibit
+  undefined behavior processing corrupted output frames.
+- Information Disclosure: If frame buffers are recycled from a pool, the
+  zero/stale regions of a partially-decoded reference frame may expose
+  contents from previously decoded frames to the output.
+- Decoder State Corruption: The pu_info and blk_info arrays reflect a
+  partially-decoded state. While re-zeroed each frame, the deblocking pass
+  (deblock_cu_r) for the CURRENT frame reads cu_split data that was
+  partially written by the failing decode_cu_r, potentially causing
+  incorrect deblock strength reads from top_str/left_str arrays.
+
+========================================================================
+SUGGESTED FIX
+========================================================================
+
+--- a/libavcodec/rv60dec.c
++++ b/libavcodec/rv60dec.c
+@@ -2367,7 +2367,9 @@ static int rv60_decode_frame(...)
+     s->avctx->execute2(s->avctx, decode_slice,
+                         s->last_frame[CUR_PIC], NULL, s->cu_height);
+
+-    ret = 0;
++    // Check if any slice reported an error
++    // (requires propagating error from execute2 or adding
++    //  a shared error flag checked by all slice threads)
+
+     if (s->pict_type == AV_PICTURE_TYPE_B)
+
+Additionally, the QP validation at line 1795 should be moved BEFORE
+reconstruction and MC (before line 1712), and the frame-level reference
+check at line 2332 should also validate NEXT_PIC when two_f_refs is set.

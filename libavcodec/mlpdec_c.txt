@@ -1,0 +1,119 @@
+Vulnerability: Non-Enforced Restart Header Checksum Enables Processing of Corrupted MLP/TrueHD Decoder State
+
+Location: libavcodec/mlpdec.c, line 635-636
+
+Severity: High (CWE-354: Improper Validation of Integrity Check Value)
+
+Description:
+The function read_restart_header() computes a checksum over the restart header data
+but only logs an error when the checksum fails, without returning an error code. The
+function continues executing and returns success (0), causing the caller to accept the
+corrupted restart header as valid:
+
+    // line 633-636
+    checksum = ff_mlp_restart_checksum(buf, get_bits_count(gbp) - start_count);
+
+    if (checksum != get_bits(gbp, 8))
+        av_log(m->avctx, AV_LOG_ERROR, "restart header checksum error\n");
+
+    /* Set default decoding parameters. */
+    s->param_presence_flags   = 0xff;
+    ...
+    return 0;  // ALWAYS returns success
+
+The restart header checksum protects critical decoder state fields that are parsed
+from the bitstream BEFORE the checksum is verified (lines 556-631):
+- min_channel, max_channel (4 bits each, line 556-557) - channel range for decoding
+- max_matrix_channel (4 bits, line 558) - matrix output channel count
+- noise_type (1 bit, line 547) - selects noise generation algorithm
+- noise_shift, noisegen_seed (lines 595-596) - noise generation parameters
+- data_check_present (1 bit, line 600) - controls extra data parsing
+- ch_assign (6 bits per channel, lines 615-631) - channel output assignment
+
+These fields are written to the SubStream struct at lines 580-584 BEFORE the checksum
+is checked at line 633. Because the checksum failure is ignored, all corrupted values
+that individually pass their range checks are accepted.
+
+This is a systemic pattern in the decoder. ALL integrity checks are log-only:
+- Restart header checksum (line 635-636): no return on failure
+- Lossless check (lines 605-608): only AV_LOG_WARNING, no return
+- Block data length check (lines 1031-1032): only av_log, no return
+- Substream parity (line 1375): only av_log, no return
+- Substream checksum (line 1377): only av_log, no return
+
+Exploitation Path:
+1. Attacker crafts an MLP/TrueHD stream with a valid major sync header to initialize
+   the decoder (m->params_valid = 1).
+
+2. The first access unit contains a valid restart header, setting restart_seen = 1
+   (line 1305) and establishing initial decoder state.
+
+3. A subsequent access unit contains a restart header with corrupted bitstream fields
+   but the checksum failure is ignored. Critical struct fields are overwritten:
+   - data_check_present flipped to 1 (line 600): causes read_block_data() to consume
+     16 extra bits (lines 1007-1008), desynchronizing the entire bitstream parser for
+     the substream. All subsequent get_bits() calls read shifted data, causing Huffman
+     VLC decoding, filter parameters, and matrix coefficients to parse as garbage.
+   - noise_shift corrupted (line 595): controls left-shift in generate_2_noise_channels
+     (lines 1079-1080). noise_shift is 4 bits (0-15), and the expression
+     ((int8_t)(seed >> 15)) * (1 << s->noise_shift) uses signed int multiplication.
+     With noise_shift=15, the maximum value is 127 * 32768 = 4,161,536, which fits
+     in int32_t, but corrupted noise data propagates through rematrix operations.
+   - ch_assign corrupted: affects output channel mapping in pack_output (line 1160),
+     potentially mapping decoded samples to wrong output channels.
+
+4. Because the corrupted restart header returns success, restart_seen remains 1
+   (or is set to 1 at line 1305), and the decoder proceeds to decode audio blocks
+   using the corrupted state. read_decoding_params() (line 1310) and
+   read_block_data() (line 1339) execute with corrupted parameters.
+
+5. The desynchronized bitstream (from corrupted data_check_present) causes the
+   Huffman decoder to consume wrong bit positions. get_vlc2() at line 281 may
+   return valid-looking but incorrect VLC codes, or the get_bits_count check at
+   line 1342 may not trigger at the right time, causing the do-while loop
+   (lines 1299-1345) to iterate incorrectly.
+
+6. With substream parity and checksum also not enforced (lines 1374-1377), the
+   corrupted data passes all remaining integrity checks and reaches output_data()
+   (line 1391), where pack_output writes corrupted samples to the output frame
+   using the corrupted ch_assign mapping.
+
+Impact:
+- Integrity bypass: An attacker can modify any field in the restart header without
+  detection, as the checksum serves no protective function. This defeats the
+  integrity guarantee that the restart header checksum was designed to provide.
+- Bitstream desynchronization: Corrupting data_check_present causes the parser to
+  consume bits at wrong positions, leading to unpredictable decoder behavior including
+  processing of attacker-controlled garbage values through filter and matrix operations.
+- The systemic nature (ALL five integrity checks are non-enforced) means there is NO
+  integrity verification anywhere in the MLP/TrueHD decode path. Every parsed field
+  relies solely on its individual range check, with no defense-in-depth.
+- Future code changes that add new fields, relax range checks, or modify buffer
+  sizes could escalate this to memory corruption, since the integrity checks that
+  should catch such issues are completely non-functional.
+
+Affected code path:
+read_access_unit() -> read_restart_header() [checksum ignored at line 636] ->
+returns 0 (success) -> restart_seen = 1 -> read_decoding_params() ->
+read_block_data() -> read_huff_channels() / filter_channel() -> output_data() ->
+pack_output() [all using corrupted state]
+
+Fix:
+Replace line 635-636:
+    if (checksum != get_bits(gbp, 8))
+        av_log(m->avctx, AV_LOG_ERROR, "restart header checksum error\n");
+With:
+    if (checksum != get_bits(gbp, 8)) {
+        av_log(m->avctx, AV_LOG_ERROR, "restart header checksum error\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+And similarly enforce the substream parity/checksum at lines 1374-1377:
+    if ((get_bits(&gb, 8) ^ parity) != 0xa9) {
+        av_log(m->avctx, AV_LOG_ERROR, "Substream %d parity check failed.\n", substr);
+        return AVERROR_INVALIDDATA;
+    }
+    if (get_bits(&gb, 8) != checksum) {
+        av_log(m->avctx, AV_LOG_ERROR, "Substream %d checksum failed.\n", substr);
+        return AVERROR_INVALIDDATA;
+    }

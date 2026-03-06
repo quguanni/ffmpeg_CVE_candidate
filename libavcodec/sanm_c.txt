@@ -1,0 +1,74 @@
+Vulnerability: Use of Uninitialized Stack Variable in old_codec23() (CWE-457)
+File: libavcodec/sanm.c
+Function: old_codec23()
+Lines: 776, 783-786, 819-823
+
+Summary:
+In the SANM/Smush video decoder's old_codec23() function, a local stack array
+lut[256] is used uninitialized when ctx->subversion >= 2 and param2 == 256.
+This causes uninitialized stack memory contents to leak into the decoded video
+frame output, constituting an information disclosure vulnerability.
+
+Root Cause:
+At line 776, a local array `uint8_t lut[256]` is declared on the stack.
+
+The initialization logic at lines 779-792 has four branches:
+  1. subversion < 2: lut[] is initialized (line 781-782)
+  2. subversion >= 2 AND param2 == 256: ctx->c23lut is filled from stream,
+     but local lut[] is NOT initialized (lines 783-786)
+  3. subversion >= 2 AND param2 < 256: lut[] is initialized (lines 788-789)
+  4. subversion >= 2 AND param2 > 256: lut[] is copied from ctx->c23lut
+     (line 791)
+
+In branch 2 (param2 == 256), only ctx->c23lut (a persistent context field)
+is populated. The local lut[256] array remains uninitialized. However, if
+there is remaining data in the byte stream after reading the 256-byte LUT
+(checked at line 793-794), execution continues into the pixel processing
+loop at lines 812-834, which uses `lut[c]` at line 823:
+
+    c = *(dst + (y * p) + pc);
+    *(dst + (y * p) + pc) = lut[c];    // <-- reads uninitialized lut[]
+
+The uninitialized stack contents are used as a color lookup table and written
+into the frame buffer (ctx->fbuf), which is then copied to the output AVFrame
+via copy_output(). An attacker viewing the decoded video output can observe
+stack memory contents.
+
+Trigger Conditions:
+  - ANIM format video file (version 0) with subversion >= 2
+  - FOBJ chunk with codec=23 and param2=256
+  - The FOBJ data contains > 256 bytes after the 12-byte header
+    (256 for c23lut + at least 3 more for pixel processing: 2 for the
+    line size + 1 for run length)
+  - Valid frame dimensions so that pixel processing actually runs
+
+All parameters are fully attacker-controlled via the crafted input file.
+
+Impact:
+  - Information Disclosure: Stack memory contents (return addresses, local
+    variables from prior function calls, potential ASLR-relevant pointers)
+    leak into the video output frame.
+  - The leaked data appears as pixel color values in the decoded video,
+    recoverable by the attacker if they can observe the decoded output.
+  - Severity: Medium (CVSS ~5.3 - network vector, no auth required,
+    confidentiality impact)
+
+Fix:
+The param2 == 256 branch should either:
+  (a) Also copy ctx->c23lut into the local lut[] after filling it:
+      bytestream2_get_bufferu(gb, ctx->c23lut, 256);
+      memcpy(lut, ctx->c23lut, 256);
+  (b) Or return early after populating ctx->c23lut (treating param2==256
+      frames as LUT-setup-only frames), since the comment at line 794
+      suggests this is the intended behavior.
+
+Secondary Vulnerability: Missing NULL Check on fbuf (CWE-476)
+Lines: 467, 477-478
+
+In init_buffers(), the fbuf pointer is allocated at line 467 via
+av_fast_padded_mallocz(), but the NULL check at lines 477-478 only validates
+frm0, frm1, frm2, and stored_frame. If fbuf allocation fails (returns NULL)
+while the other allocations succeed, init_buffers() returns success (0).
+Subsequent codec functions (old_codec1, old_codec2, old_codec20, old_codec21,
+old_codec23, old_codec31, old_codec45, etc.) all write to (uint8_t*)ctx->fbuf,
+causing a NULL pointer dereference and crash (denial of service).

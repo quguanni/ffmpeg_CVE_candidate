@@ -1,0 +1,123 @@
+Vulnerability: Missing Bounds Validation of init_qp/init_qs in PPS Parsing
+File: libavcodec/h264_ps.c
+Severity: High (Out-of-bounds access via hardware decoder APIs / Denial of Service)
+Type: CWE-20 Improper Input Validation / CWE-190 Integer Overflow
+
+=== Summary ===
+
+In ff_h264_decode_picture_parameter_set(), the pic_init_qp_minus26 and
+pic_init_qs_minus26 values decoded from the PPS NAL unit are not validated
+against the H.264 specification's required range. The values are computed
+using unsigned arithmetic that can wrap, producing arbitrary int values
+stored in pps->init_qp and pps->init_qs. These unchecked values are then
+passed directly to hardware video decoder APIs (DXVA2, NVDEC, VDPAU)
+without any sanitization, potentially triggering driver-level out-of-bounds
+access or other vulnerabilities in GPU kernel drivers.
+
+=== Root Cause ===
+
+At lines 774-775 of h264_ps.c:
+
+    pps->init_qp = get_se_golomb(gb) + 26U + qp_bd_offset;
+    pps->init_qs = get_se_golomb(gb) + 26U + qp_bd_offset;
+
+The H.264 spec (Section 7.4.2.2) requires:
+    pic_init_qp_minus26 ∈ [-(26 + QpBdOffsetY), 25]
+
+This means the valid range for init_qp is [0, 51 + QpBdOffsetY], i.e.,
+[0, QP_MAX_NUM] where QP_MAX_NUM = 87.
+
+However, get_se_golomb() can return values spanning nearly the full int
+range (approximately ±2^30). There is NO bounds check on the decoded value
+before or after the arithmetic.
+
+The use of "26U" (unsigned literal) causes the entire expression to use
+unsigned arithmetic due to C's implicit type promotion rules:
+  1. get_se_golomb() returns int
+  2. Adding to 26U promotes the int to unsigned int
+  3. Adding qp_bd_offset (int) also promotes to unsigned
+  4. The unsigned result is stored in pps->init_qp (int), which is
+     implementation-defined if the unsigned value exceeds INT_MAX
+
+This means pps->init_qp can hold ANY int value — large positive, large
+negative, or any value in between.
+
+Contrast with chroma_qp_index_offset[0] at line 777 which IS validated:
+
+    pps->chroma_qp_index_offset[0] = get_se_golomb(gb);
+    if (pps->chroma_qp_index_offset[0] < -12 ||
+        pps->chroma_qp_index_offset[0] > 12) {
+        ret = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+
+No equivalent check exists for init_qp or init_qs.
+
+=== Affected Code Paths ===
+
+The unchecked init_qp value flows to multiple downstream consumers:
+
+1. DXVA2 hardware decoder (dxva2_h264.c:145):
+     pp->pic_init_qp_minus26 = pps->init_qp - 26;
+   Passes arbitrary value to Windows DXVA2 driver.
+
+2. DXVA2 slice parameters (dxva2_h264.c:290):
+     slice->slice_qp_delta = sl->qscale - h->ps.pps->init_qp;
+   Integer underflow, passed to driver.
+
+3. NVDEC hardware decoder (nvdec_h264.c:101):
+     .pic_init_qp_minus26 = pps->init_qp - 26 - 6*(sps->bit_depth_luma-8),
+   Passes arbitrary value to NVIDIA GPU driver.
+
+4. Software decoder slice header (h264_slice.c:1863):
+     tmp = pps->init_qp + (unsigned)get_se_golomb(&sl->gb);
+     if (tmp > 51 + 6 * (sps->bit_depth_luma - 8)) { ... }
+   The unsigned arithmetic provides partial mitigation: most out-of-range
+   combinations are caught. However, specific init_qp + slice_qp_delta
+   pairs can wrap the unsigned result to a valid QP value (0-87),
+   bypassing the check while the individual components remain illegal.
+
+=== Impact ===
+
+1. GPU Driver Exploitation: Hardware decoder APIs receive unchecked QP
+   values. GPU drivers may use these values as array indices for
+   dequantization tables without re-validation, causing kernel-mode
+   out-of-bounds read/write. This is especially critical in:
+   - Virtualized environments (potential VM escape)
+   - Browsers using hardware-accelerated video decoding
+   - Media players on shared/multi-tenant systems
+
+2. Denial of Service: An out-of-range init_qp passed to a hardware
+   decoder driver can cause GPU hangs, kernel panics, or system crashes.
+
+3. Information Disclosure: Out-of-bounds reads in GPU driver memory
+   could leak kernel address space data.
+
+=== Trigger Conditions ===
+
+- Input is an H.264 bitstream with a valid SPS followed by a crafted PPS
+- The PPS contains an out-of-range pic_init_qp_minus26 value encoded as
+  an Exp-Golomb signed integer (e.g., value 1000 instead of valid [-62,25])
+- The PPS references a valid SPS (sps_id must match an existing SPS)
+- A hardware decoder backend (DXVA2, NVDEC, VDPAU) must be active for
+  the most severe impact; software decoder has partial mitigation
+
+=== Suggested Fix ===
+
+Add bounds validation after computing init_qp and init_qs:
+
+    pps->init_qp = get_se_golomb(gb) + 26U + qp_bd_offset;
+    pps->init_qs = get_se_golomb(gb) + 26U + qp_bd_offset;
++   if (pps->init_qp > 51 + qp_bd_offset) {
++       av_log(avctx, AV_LOG_ERROR,
++              "init_qp %d out of range\n", pps->init_qp);
++       ret = AVERROR_INVALIDDATA;
++       goto fail;
++   }
++   if (pps->init_qs > 51 + qp_bd_offset) {
++       av_log(avctx, AV_LOG_ERROR,
++              "init_qs %d out of range\n", pps->init_qs);
++       ret = AVERROR_INVALIDDATA;
++       goto fail;
++   }
+    pps->chroma_qp_index_offset[0] = get_se_golomb(gb);

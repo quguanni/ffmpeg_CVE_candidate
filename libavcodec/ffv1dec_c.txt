@@ -1,0 +1,90 @@
+Vulnerability: Heap Buffer Over-Read in FFV1 Decoder via fltmap Remap Table
+=============================================================================
+
+File: libavcodec/ffv1dec.c
+Severity: HIGH (Heap OOB Read → Information Disclosure / Potential Code Execution)
+Affected function: decode_plane()
+
+Summary
+-------
+An out-of-bounds heap read exists in the FFV1 decoder's remap path within
+decode_plane(). When decoding 8-bit content with remap enabled, decoded
+sample values in range [0, 255] are used directly as indices into the
+heap-allocated fltmap[] array WITHOUT any bounds check or mask. The fltmap
+array is allocated with only `pixel_num` (= slice_width * slice_height)
+entries. By crafting an FFV1 bitstream with a small slice (e.g. 4x4 = 16
+pixels) and remap enabled, an attacker can read up to 478 bytes (239
+uint16_t entries) past the end of the heap buffer.
+
+A secondary integer overflow in the computation of pixel_num
+(slice_width * slice_height as int) can further reduce the allocation
+size, extending the OOB reach even for higher bit depths.
+
+Root Cause
+----------
+In decode_plane(), line 139:
+
+    for (x = 0; x < w; x++)
+        sample[1][x] = sc->fltmap[remap_index][sample[1][x]];  // LINE 139
+
+- decode_line() is called with bits=8 (hardcoded at line 134), so
+  sample[1][x] values are in [0, 255] (via the fold() function).
+- sc->fltmap[remap_index] is allocated at line 411 via av_fast_malloc()
+  with size = pixel_num * sizeof(uint16_t), where
+  pixel_num = slice_width * slice_height (line 403).
+- If pixel_num < 256 (e.g. a 4x4 slice → pixel_num=16), then
+  sample[1][x] values of 16..255 index beyond the allocated buffer.
+- There is NO bounds check and NO mask applied in the 8-bit code path
+  (contrast with the >8-bit path at line 150 which uses "& mask").
+
+The >8-bit remap path (line 150) also has a related issue:
+    sc->fltmap[remap_index][sample[1][x] & mask]
+where mask = (1 << av_ceil_log2(remap_count)) - 1. Since ceil_log2
+rounds up, the mask can be up to (2 * remap_count - 1), exceeding
+pixel_num and allowing OOB reads there as well.
+
+Integer Overflow (Secondary):
+    Line 302/403: const int pixel_num = sc->slice_width * sc->slice_height;
+Both are int, so large slice dimensions (e.g. 65536 x 32769) overflow
+the 32-bit product, wrapping to a small positive value. This causes a
+tiny heap allocation for fltmap while the decoder processes a huge number
+of pixels, massively amplifying the OOB access.
+
+Impact
+------
+- Heap buffer over-read: attacker-controlled index reads up to hundreds
+  of bytes past the fltmap heap allocation.
+- Information disclosure: the OOB-read values are written into the decoded
+  video frame (line 141: src[...] = sample[1][x]), leaking heap contents
+  as pixel data visible to the caller.
+- Potential for further exploitation: depending on heap layout, the leaked
+  data may contain heap metadata, pointers, or other sensitive information.
+  In combination with other vulnerabilities, this could aid in achieving
+  code execution.
+
+Trigger Conditions
+------------------
+1. FFV1 version >= 4 (to enable remap feature)
+2. sc->remap enabled (set via slice header, requires f->flt)
+3. bits_per_raw_sample <= 8 (to hit the unmasked 8-bit code path)
+4. Small slice dimensions such that slice_width * slice_height < 256
+5. Decoded sample values >= pixel_num (controlled via crafted bitstream)
+
+Fix Recommendation
+------------------
+Add bounds checking before the fltmap index access. For the 8-bit path,
+apply the same masking as the >8-bit path:
+
+    if (sc->remap)
+        for (x = 0; x < w; x++) {
++           if ((unsigned)sample[1][x] >= sc->remap_count[remap_index])
++               return AVERROR_INVALIDDATA;
+            sample[1][x] = sc->fltmap[remap_index][sample[1][x]];
+        }
+
+Also fix the integer overflow:
+-   const int pixel_num = sc->slice_width * sc->slice_height;
++   int64_t pixel_num64 = (int64_t)sc->slice_width * sc->slice_height;
++   if (pixel_num64 > INT_MAX)
++       return AVERROR_INVALIDDATA;
++   const int pixel_num = (int)pixel_num64;

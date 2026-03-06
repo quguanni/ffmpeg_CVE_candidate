@@ -1,0 +1,112 @@
+Vulnerability: Heap Buffer Overflow via Negative nbits in read_diff_float_data()
+
+File: libavcodec/alsdec.c
+Function: read_diff_float_data()
+Lines: 1558-1610
+Severity: Critical (Heap Buffer Overflow / Arbitrary Code Execution)
+Type: CWE-787 (Out-of-bounds Write), CWE-190 (Integer Overflow/Underflow)
+
+== Summary ==
+
+In read_diff_float_data(), the computation of nbits[i] at line 1563 can produce
+negative values when a decoded raw sample has a large absolute value (>= 2^24).
+This negative nbits value is never validated and flows into two dangerous sinks:
+
+1. get_bitsz(gb, nbits[i]) with negative nbits — undefined behavior via negative
+   bit shifts in the bitstream reader (out-of-bounds read).
+
+2. ff_mlz_decompression(ctx->mlz, gb, nchars, larray) with negative nchars —
+   the MLZ decompressor interprets the negative int as a huge unsigned long,
+   causing a massive heap buffer overflow writing past the larray buffer.
+
+== Root Cause ==
+
+At line 1563:
+    nbits[i] = 23 - av_log2(abs(ctx->raw_samples[c][i]));
+
+When abs(ctx->raw_samples[c][i]) >= 2^24 (i.e., av_log2 returns >= 24),
+nbits[i] becomes negative (e.g., 23 - 31 = -8 for a sample of INT32_MIN).
+
+The subsequent FFMIN at line 1567 does not help:
+    nbits[i] = FFMIN(nbits[i], highest_byte*8);
+Since nbits[i] is already negative, FFMIN returns the negative value.
+
+There is NO validation that nbits[i] >= 0 before it is used.
+
+== Exploitation Path 1: Uncompressed Part B (OOB Read / UB) ==
+
+At lines 1571-1576:
+    if (!get_bits1(gb)) { //uncompressed
+        for (i = 0; i < frame_length; ++i) {
+            if (ctx->raw_samples[c][i] != 0) {
+                raw_mantissa[c][i] = get_bitsz(gb, nbits[i]);  // nbits[i] < 0!
+            }
+        }
+    }
+
+get_bitsz(gb, n) calls get_bits(gb, n) when n != 0. get_bits() uses macros
+SHOW_UBITS and LAST_SKIP_BITS which perform bit shifts by n. A negative shift
+amount is undefined behavior in C. On most architectures this corrupts the
+bitstream reader state and can cause out-of-bounds reads from the packet buffer.
+
+== Exploitation Path 2: Compressed Part B (Heap Buffer Overflow) ==
+
+At lines 1578-1586, nchars is computed:
+    nchars = 0;
+    for (i = 0; i < frame_length; ++i) {
+        if (ctx->raw_samples[c][i]) {
+            nchars += (int) nbits[i] / 8;   // adds -1 when nbits[i] == -8
+            if (nbits[i] & 7) {
+                ++nchars;
+            }
+        }
+    }
+
+When nbits[i] = -8: (int)(-8)/8 = -1, and (-8) & 7 = 0 (two's complement:
+0xFFFFFFF8 & 0x7 = 0), so nchars decrements by 1 per affected sample.
+With enough large-valued samples, nchars becomes negative.
+
+At line 1588:
+    tmp_32 = ff_mlz_decompression(ctx->mlz, gb, nchars, larray);
+
+In ff_mlz_decompression() (mlz.c:129-204), the size parameter (nchars) is int,
+but it is compared against output_chars which is unsigned long:
+    while (output_chars < size)  // size promoted to unsigned long
+
+A negative size becomes a very large unsigned long value (~2^64 - |nchars|),
+causing the decompression loop to write far beyond the larray heap buffer
+(allocated as frame_length * 4 bytes). This is an exploitable heap buffer
+overflow that can lead to arbitrary code execution.
+
+== Additional Issue: abs(INT32_MIN) Undefined Behavior ==
+
+When raw_samples[c][i] == INT32_MIN (-2147483648), abs(INT32_MIN) is undefined
+behavior per the C standard (the result cannot be represented as int). On most
+implementations it returns INT32_MIN, but this is not guaranteed.
+
+== Triggering Conditions ==
+
+1. sconf->floating = 1 (floating-point ALS mode)
+2. use_acf = 1 with acf[c] != FLOAT_1 (to enter the av_log2 branch)
+3. highest_byte > 0 (to enter the Part B section)
+4. Decoded raw integer samples with abs value >= 2^24 (achievable via Rice
+   coding with appropriate parameters)
+5. For heap overflow: the compressed flag bit at line 1577 must be set
+
+== Impact ==
+
+- Heap buffer overflow: attacker-controlled write past larray buffer
+- Out-of-bounds read from bitstream buffer
+- Undefined behavior via negative shift amounts
+- Potential for arbitrary code execution when processing crafted ALS audio files
+- Remotely exploitable (e.g., via malicious audio file in a media player)
+
+== Suggested Fix ==
+
+Add validation after line 1567:
+    nbits[i] = FFMIN(nbits[i], highest_byte*8);
++   if (nbits[i] < 0)
++       nbits[i] = 0;
+
+Or clamp the value:
+    nbits[i] = FFMAX(FFMIN(nbits[i], highest_byte*8), 0);

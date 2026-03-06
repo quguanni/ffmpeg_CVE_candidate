@@ -1,0 +1,144 @@
+VULNERABILITY: Integer Underflow and Out-of-Bounds Stream Read in mxf_get_eia608_packet()
+
+FILE: libavformat/mxfdec.c
+FUNCTION: mxf_get_eia608_packet() (lines 546-619)
+TYPE: CWE-191 (Integer Underflow), CWE-125 (Out-of-bounds Read)
+SEVERITY: HIGH (CVSS ~7.8 - local code execution / information disclosure via crafted MXF file)
+
+SUMMARY:
+The mxf_get_eia608_packet() function, which extracts EIA-608 closed caption data
+from SMPTE 436M ANC data packets within MXF files, contains two interrelated
+vulnerabilities:
+
+1. Stream Desynchronization via Improper Length Tracking (line 566)
+2. Negative avio_skip Due to Missing Bounds Check on data_length (line 607)
+
+DETAILED ANALYSIS:
+
+--- Bug #1: Stream Desynchronization (line 566) ---
+
+When processing multiple ANC packets (count from avio_rb16 at line 548), the
+function decrements `length` by `6 + 8 + sample_count` for each packet at
+line 566:
+
+    line_num = avio_rb16(s->pb);       // 2 bytes read
+    avio_r8(s->pb);                    // 1 byte read
+    sample_coding = avio_r8(s->pb);    // 1 byte read
+    sample_count = avio_rb16(s->pb);   // 2 bytes read
+    length -= 6 + 8 + sample_count;    // subtract 6 + 8 + sample_count
+    if (line_num != 9 && line_num != 11)
+        continue;                      // BUG: only 6 bytes consumed, but
+                                       // 6+8+sample_count subtracted from length
+
+When `line_num` is not 9 or 11, the code `continue`s at line 568, but only 6
+bytes have been actually consumed from the I/O stream. The `8 + sample_count`
+bytes that were subtracted from `length` were never read. This desynchronizes
+the `length` tracker from the actual stream position.
+
+On subsequent loop iterations, the code reads from wrong stream offsets,
+misinterpreting arbitrary data bytes as ANC packet headers (line_num,
+sample_coding, sample_count). An attacker can craft the MXF file so that
+these misinterpreted bytes produce:
+  - A matching line_num (9 or 11), causing the code to proceed with parsing
+  - Controlled values for cc_count, data_length, etc.
+
+--- Bug #2: Negative avio_skip (line 607) ---
+
+At line 607:
+    avio_skip(s->pb, data_length - 9 - 4 - cc_count * 3);
+
+`data_length` is a single attacker-controlled byte from avio_r8(s->pb) at
+line 580 (range 0-255). `cc_count` is `avio_r8(s->pb) & 0x1f` at line 599
+(range 0-31), so `cc_count * 3` ranges from 0 to 93.
+
+There is NO validation that `data_length >= 13 + cc_count * 3`. When
+`data_length` is small (e.g., 0), the expression evaluates to a negative
+number (e.g., 0 - 9 - 4 - 0 = -13), causing avio_skip to seek BACKWARD
+in the stream. On a seekable file, this causes re-reading of previously
+processed bytes, further corrupting the parse state.
+
+--- Combined Impact ---
+
+These two bugs together create an exploitable condition:
+
+1. The attacker crafts an MXF file with eia608_extract enabled, containing
+   ANC data with count > 1.
+2. The first ANC packet has line_num != 9/11 with a large sample_count,
+   desynchronizing the stream position from the length tracker.
+3. The desynchronized reads interpret data bytes as valid CDP headers.
+4. When a crafted data_length value triggers the negative avio_skip,
+   it causes backward seeking, potentially re-processing data.
+5. In the ERROR path (e.g., cdp_identifier != 0x9669 at line 586, or
+   cdp_footer_id != 0x74 at line 609), the function returns an error
+   WITHOUT correcting the stream position. The caller at line 4142-4145
+   in mxf_read_packet() also returns immediately without seeking to
+   klv.next_klv, leaving the stream permanently desynchronized.
+
+This permanent stream desynchronization means subsequent calls to
+mxf_read_packet() will parse from wrong positions, potentially
+interpreting crafted data as KLV keys/values, leading to:
+  - Heap-based buffer over-read when subsequent parsing functions
+    read attacker-controlled sizes from wrong stream positions
+  - Denial of service via parsing loops or crashes
+  - Information disclosure via corrupted packet data
+
+AFFECTED CODE:
+
+    static int mxf_get_eia608_packet(AVFormatContext *s, AVStream *st,
+                                      AVPacket *pkt, int64_t length)
+    {
+        int count = avio_rb16(s->pb);  // line 548: attacker-controlled
+        ...
+        for (int i = 0; i < count; i++) {
+            ...
+            sample_count = avio_rb16(s->pb);        // line 565
+            length -= 6 + 8 + sample_count;         // line 566: BUG #1
+            if (line_num != 9 && line_num != 11)
+                continue;  // stream not advanced by 8+sample_count bytes!
+            ...
+            data_length = avio_r8(s->pb);            // line 580
+            ...
+            cc_count = avio_r8(s->pb) & 0x1f;       // line 599
+            ...
+            avio_skip(s->pb, data_length - 9 - 4 - cc_count * 3); // line 607: BUG #2
+            ...
+        }
+    }
+
+SUGGESTED FIX:
+
+1. After reading the 6-byte ANC header and before the `continue`, skip the
+   remaining `8 + sample_count` bytes to keep the stream position in sync:
+
+    length -= 6 + 8 + sample_count;
+    if (line_num != 9 && line_num != 11) {
++       avio_skip(s->pb, 8 + sample_count);
+        continue;
+    }
+
+2. Add bounds checking before the avio_skip at line 607:
+
++   if (data_length < 9 + 4 + cc_count * 3) {
++       av_log(s, AV_LOG_ERROR, "data_length %d too small for cc_count %d\n",
++              data_length, cc_count);
++       return AVERROR_INVALIDDATA;
++   }
+    avio_skip(s->pb, data_length - 9 - 4 - cc_count * 3);
+
+3. In mxf_read_packet(), ensure stream position is corrected on error:
+
+    ret = mxf_get_eia608_packet(s, s->streams[index], pkt, klv.length);
+    if (ret < 0) {
+        mxf->current_klv_data = (KLVPacket){{0}};
++       avio_seek(s->pb, klv.next_klv, SEEK_SET);
+        return ret;
+    }
+
+PREREQUISITES:
+- The MXF file must contain SMPTE 436M ANC data tracks (codec_id == AV_CODEC_ID_SMPTE_436M_ANC)
+- The eia608_extract option must be enabled (set to 1)
+- The ANC data must be identified as EIA-608 captions
+
+REPRODUCTION:
+A crafted MXF file with specially constructed ANC data packets can trigger
+both vulnerabilities. See accompanying PoC for details.

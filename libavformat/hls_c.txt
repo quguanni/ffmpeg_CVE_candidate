@@ -1,0 +1,110 @@
+Vulnerability: Use-After-Free / Double-Free in HLS EXT-X-MAP Init Section Handling
+File: libavformat/hls.c
+Severity: High (CWE-416 Use After Free / CWE-415 Double Free)
+
+=== Summary ===
+
+A use-after-free and double-free vulnerability exists in parse_playlist() when
+processing #EXT-X-MAP directives (media initialization sections) with AES-128
+or SAMPLE-AES encryption enabled via #EXT-X-KEY. A crafted HLS playlist can
+trigger this to crash FFmpeg or potentially achieve arbitrary code execution.
+
+=== Root Cause ===
+
+In parse_playlist() (lines 917-952), when an #EXT-X-MAP directive is parsed:
+
+1. new_init_section() is called (line 923), which allocates a segment struct,
+   sets its url field via av_strdup(), and ADDS IT to pls->init_sections via
+   dynarray_add() at line 460, then returns the pointer.
+
+2. If key_type != KEY_NONE (encryption is active), the code at lines 937-949
+   attempts to construct the key URL and allocate it.
+
+3. If ff_make_absolute_url() produces an empty result (line 939) OR if
+   av_strdup() fails (line 944), the code calls av_free(cur_init_section)
+   and jumps to the fail label.
+
+THE BUG: The init section was ALREADY added to pls->init_sections by
+new_init_section() at line 460. When av_free(cur_init_section) is called at
+line 940 or 946, the struct is freed, but the DANGLING POINTER remains in
+pls->init_sections[pls->n_init_sections - 1].
+
+Later, during cleanup (hls_close -> free_playlist_list -> free_init_section_list),
+the code at lines 258-261 iterates over pls->init_sections and:
+  - Dereferences the freed pointer to access ->key and ->url (USE-AFTER-FREE)
+  - Calls av_freep() on the already-freed struct (DOUBLE-FREE)
+
+=== Affected Code ===
+
+parse_playlist(), lines 937-949:
+
+    if (key_type != KEY_NONE) {
+        ff_make_absolute_url(tmp_str, sizeof(tmp_str), url, key);
+        if (!tmp_str[0]) {
+            av_free(cur_init_section);   // BUG: dangling ptr in init_sections
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
+        cur_init_section->key = av_strdup(tmp_str);
+        if (!cur_init_section->key) {
+            av_free(cur_init_section);   // BUG: dangling ptr in init_sections
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
+free_init_section_list(), lines 255-265:
+
+    for (i = 0; i < pls->n_init_sections; i++) {
+        av_freep(&pls->init_sections[i]->key);  // UAF: deref freed ptr
+        av_freep(&pls->init_sections[i]->url);  // UAF: deref freed ptr
+        av_freep(&pls->init_sections[i]);        // DOUBLE-FREE
+    }
+
+=== Additional Issues ===
+
+1. Memory leak: av_free(cur_init_section) at lines 940/946 frees the struct
+   but does NOT free cur_init_section->url, which was allocated by av_strdup()
+   in new_init_section() at line 444.
+
+2. The pls->n_init_sections counter is not decremented, so the dangling
+   pointer is guaranteed to be accessed during cleanup.
+
+=== Trigger Conditions ===
+
+To trigger via the ff_make_absolute_url empty result path (line 939):
+- Set #EXT-X-KEY with METHOD=AES-128 and a KEY URI
+- Set #EXT-X-MAP with a valid URI
+- The combination of playlist URL + key URI must cause ff_make_absolute_url()
+  to produce an empty string (e.g., both URLs near MAX_URL_SIZE length causing
+  the result to be truncated/empty)
+
+To trigger via the av_strdup failure path (line 944-948):
+- Set #EXT-X-KEY with METHOD=AES-128 and any URI
+- Set #EXT-X-MAP with a valid URI
+- Trigger memory exhaustion (e.g., via many large allocations in the same
+  playlist parse, or system memory pressure)
+
+=== Impact ===
+
+- Denial of Service: Guaranteed crash via double-free
+- Potential Code Execution: The double-free corrupts the heap allocator
+  metadata. An attacker who can control the allocation pattern between the
+  first free and the second free may achieve arbitrary write, leading to
+  code execution. This is a well-known exploitation technique for double-free
+  vulnerabilities in glibc malloc.
+- The vulnerability is remotely triggerable: an attacker hosts a malicious
+  HLS playlist on a server, and the victim opens it with any FFmpeg-based
+  application (ffplay, ffmpeg, VLC, etc.).
+
+=== Suggested Fix ===
+
+Instead of freeing cur_init_section directly, remove it from the init_sections
+array, or do not add it to the array until all allocations succeed. The cleanest
+fix is to defer adding to the array:
+
+In new_init_section(): remove the dynarray_add() call (line 460).
+In parse_playlist(): add dynarray_add() AFTER all error checks pass (after line 952).
+
+Alternatively, on error, decrement pls->n_init_sections and free both
+cur_init_section->url and cur_init_section before jumping to fail.

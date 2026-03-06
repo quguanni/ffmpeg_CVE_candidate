@@ -1,0 +1,100 @@
+Vulnerability: Integer Underflow in SMV Chunk Parsing Leading to Out-of-Bounds Read
+File: libavformat/wavdec.c
+Severity: High (CVSS ~7.1)
+CWE: CWE-191 (Integer Underflow) -> CWE-125 (Out-of-Bounds Read)
+
+=== Summary ===
+
+An integer underflow vulnerability exists in the WAV demuxer's SMV (Surveillance
+Motion Video) chunk parsing in wav_read_header(). A crafted WAV file with a
+malicious SMV0 chunk can cause the demuxer to compute an incorrect data offset,
+leading to out-of-bounds reads from unintended file positions during packet
+reading. This can cause information disclosure (leaking file content as video
+frames) or denial of service (crash).
+
+=== Root Cause ===
+
+In wav_read_header(), at line 510-511:
+
+    size = avio_rl24(pb);                                    // line 510
+    wav->smv_data_ofs = avio_tell(pb) + (size - 5) * 3;     // line 511
+
+The value `size` is read from the file as an unsigned 24-bit integer (range
+0 to 16777215) but there is NO validation that size >= 5 before the arithmetic
+expression `(size - 5) * 3`. When size < 5, the subtraction `(size - 5)`
+produces a negative value (since `size` is stored in int64_t), and multiplying
+by 3 amplifies it. This causes `smv_data_ofs` to point BEFORE the intended
+SMV data area.
+
+=== Exploitation Path ===
+
+1. Attacker crafts a WAV file containing an SMV0 chunk where the size field
+   (at the position read by line 510) is set to a value less than 5 (e.g., 0).
+
+2. With size=0: (0 - 5) * 3 = -15, so smv_data_ofs = file_position - 15.
+   This points backward into the WAV header or fmt chunk area.
+
+3. During wav_read_packet() (line 736-738):
+
+       uint64_t old_pos = avio_tell(s->pb);
+       uint64_t new_pos = wav->smv_data_ofs +
+           wav->smv_block * (int64_t)wav->smv_block_size;
+
+   The negative smv_data_ofs (int64_t) is implicitly converted to uint64_t,
+   causing unsigned integer wraparound. Depending on the values:
+
+   a) If smv_data_ofs is negative and the magnitude exceeds smv_block *
+      smv_block_size, new_pos wraps to a huge value near UINT64_MAX. The
+      avio_seek() at line 739 fails, setting smv_eof=1 (DoS - no video).
+
+   b) If smv_data_ofs remains positive (file position > |negative offset|),
+      new_pos points to a valid but WRONG location within the file. The
+      demuxer then:
+      - Reads 3 bytes from the wrong position as a packet size (line 743)
+      - Reads up to smv_block_size bytes as video frame data (line 748)
+      This leaks arbitrary file content as video frame data.
+
+4. The smv_block_size (line 513) is also attacker-controlled from avio_rl24(),
+   with only a zero-check (line 514). Setting it to 16777215 (max 24-bit)
+   allows reading up to ~16MB per packet from the wrong file position.
+
+=== Additional Issues in SMV Parsing ===
+
+- Line 504-505: vst->codecpar->width and height are read from avio_rl24()
+  with NO validation, allowing zero or absurdly large dimensions.
+
+- Line 520: smv_frames_per_jpeg can be 0 (only checked for > 65536).
+  While wav_read_seek() guards the division at line 817 with an
+  `if (smv_frames_per_jpeg > 0)` check, a zero value causes
+  pkt->pts = smv_block * 0 = 0 and pkt->duration = 0 for every frame,
+  breaking timestamp progression.
+
+=== Impact ===
+
+- Out-of-bounds read: Arbitrary data from within the WAV file can be read
+  and returned as video frame packets, potentially leaking sensitive data
+  embedded in the file.
+- Denial of Service: The demuxer may crash or enter degraded states when
+  seeking to invalid positions, or when downstream decoders receive
+  corrupted/unexpected data.
+- Memory exhaustion: With a large smv_block_size, each packet can allocate
+  up to 16MB, causing repeated large allocations.
+
+=== Affected Code Path ===
+
+wav_read_header() -> SMV0 case (line 484-526)
+  -> wav_read_packet() -> SMV video branch (line 735-763)
+
+=== Fix ===
+
+Add validation at line 510 to ensure size >= 5:
+
+    size = avio_rl24(pb);
++   if (size < 5) {
++       av_log(s, AV_LOG_ERROR, "invalid SMV size field: %"PRId64"\n", size);
++       return AVERROR_INVALIDDATA;
++   }
+    wav->smv_data_ofs = avio_tell(pb) + (size - 5) * 3;
+
+Additionally, validate that smv_data_ofs does not exceed the file size and
+that width/height are non-zero and reasonable.

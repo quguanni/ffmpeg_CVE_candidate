@@ -1,0 +1,117 @@
+Vulnerability: Heap Out-of-Bounds Write via Unchecked AV_WN32 in exif_write_ifd()
+File: libavcodec/exif.c
+Line: 737
+CWE: CWE-787 (Out-of-bounds Write)
+Severity: High
+
+=== Summary ===
+
+In exif_write_ifd() at line 737, a raw 4-byte write is performed using
+AV_WN32(pb->buffer, 0) that completely bypasses the PutByteContext's
+bounds-checking mechanism. All other write operations in this function use
+the bounds-checked bytestream2_put_* API (tput16/tput32/tput64), which
+verify that sufficient space remains before writing and set an eof flag on
+overflow. The AV_WN32 macro writes directly to the raw buffer pointer
+without any such check.
+
+=== Root Cause ===
+
+In exif_write_ifd() (line 693), when writing inline tag payloads (payload
+size <= 4 bytes), the code at line 735-739 does:
+
+    } else {
+        /* zero uninitialized excess payload values */
+        AV_WN32(pb->buffer, 0);       // RAW WRITE - NO BOUNDS CHECK
+        exif_write_values(pb, le, entry);
+        bytestream2_seek_p(pb, 4 - payload_size, SEEK_CUR);
+    }
+
+The PutByteContext API (defined in bytestream.h) provides bounds checking
+via bytestream2_put_le32/bytestream2_put_be32, which check:
+
+    if (!p->eof && (p->buffer_end - p->buffer >= bytes)) {
+        write(p->buffer, value);
+        p->buffer += bytes;
+    } else
+        p->eof = 1;
+
+AV_WN32(pb->buffer, 0) bypasses this check entirely, writing 4 bytes
+directly to the memory pointed to by pb->buffer regardless of how much
+space remains between pb->buffer and pb->buffer_end.
+
+=== Exploitation Scenario ===
+
+The buffer for EXIF writing is allocated in av_exif_write() (line 786)
+based on the return value of exif_get_ifd_size(). The write position in
+exif_write_ifd() depends on sequential tag processing and seek operations.
+
+Critical interaction with bytestream2_seek_p(): The seek function (line
+240 of bytestream.h) RESETS the eof flag (p->eof = 0) on every call,
+even if a previous bounds-checked write failed. This means:
+
+  1. A bounds-checked write (tput16/tput32) fails due to insufficient
+     space, setting p->eof = 1 and NOT advancing pb->buffer.
+  2. A subsequent bytestream2_seek_p() call resets p->eof = 0 and clamps
+     pb->buffer to buffer_end.
+  3. AV_WN32(pb->buffer, 0) then writes 4 bytes at buffer_end, which is
+     a heap buffer overflow.
+
+This can occur when exif_get_ifd_size() returns a value smaller than what
+exif_write_ifd() actually needs (size calculation mismatch). One such
+mismatch exists in the MakerNote handling: at line 710, the MakerNote
+count field is written as ifd_size (sub-IFD size only) instead of
+ifd_size + entry->ifd_offset (which includes the leading header bytes).
+While this specific mismatch affects the metadata count field rather than
+the data layout, it demonstrates that the size calculation logic is
+error-prone, and any future discrepancy would immediately become a heap
+overflow due to the unchecked AV_WN32.
+
+=== Secondary Issue: Incorrect MakerNote Count (line 710) ===
+
+When writing MakerNote tags, the count field is set to
+exif_get_ifd_size(&entry->value.ifd) but the actual out-of-line data
+is entry->ifd_offset + ifd_size bytes (the leading header bytes plus the
+sub-IFD). This produces incorrectly formatted EXIF output where the
+MakerNote count is too small by entry->ifd_offset bytes. Third-party
+EXIF parsers that trust this count field would read truncated MakerNote
+data, potentially leading to buffer over-reads in those parsers.
+
+=== Impact ===
+
+- Heap buffer overflow (4 bytes) in the EXIF write path
+- Triggered when processing EXIF metadata for output (e.g., image
+  transcoding with EXIF preservation)
+- Could lead to arbitrary code execution via heap corruption
+- The MakerNote count bug produces malformed EXIF output that can cause
+  vulnerabilities in downstream EXIF parsers
+
+=== Affected Code Path ===
+
+av_exif_write() -> exif_write_ifd() -> AV_WN32(pb->buffer, 0)
+
+Also reachable via:
+ff_exif_get_buffer() -> ff_exif_sanitize_ifd() -> av_exif_write()
+
+=== Fix ===
+
+Replace the raw AV_WN32 with a bounds-checked write:
+
+    // Before (vulnerable):
+    AV_WN32(pb->buffer, 0);
+
+    // After (fixed):
+    bytestream2_put_le32(pb, 0);
+    bytestream2_seek_p(pb, -4, SEEK_CUR);
+
+Or equivalently, use tput32:
+
+    tput32(pb, le, 0);
+    bytestream2_seek_p(pb, -4, SEEK_CUR);
+
+And fix the MakerNote count at line 710:
+
+    // Before:
+    tput32(pb, le, ifd_size);
+
+    // After:
+    tput32(pb, le, ifd_size + entry->ifd_offset);

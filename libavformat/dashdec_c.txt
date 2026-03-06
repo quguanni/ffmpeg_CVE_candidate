@@ -1,0 +1,100 @@
+Vulnerability: Division by Zero in calc_max_seg_no() — Denial of Service (Crash)
+File: libavformat/dashdec.c
+Severity: HIGH (Crash / DoS via crafted input)
+Type: CWE-369 (Divide By Zero)
+
+=== Summary ===
+
+A crafted DASH MPD manifest can trigger a division-by-zero (SIGFPE) crash in
+calc_max_seg_no(), causing an immediate denial of service when FFmpeg attempts
+to open the malicious stream. The crash occurs during header parsing, so no
+user interaction beyond opening the file is required.
+
+=== Root Cause ===
+
+In calc_max_seg_no() at line 1469-1470:
+
+    if (pls->timelines[i]->repeat == -1) {
+        int length_of_each_segment = pls->timelines[i]->duration / pls->fragment_timescale;
+        num =  c->period_duration / length_of_each_segment;
+    }
+
+Two division-by-zero paths exist:
+
+1. pls->fragment_timescale == 0: The field defaults to 0 (from av_mallocz).
+   The only place it gets set to a non-zero fallback is line 1094:
+       if (rep->fragment_duration > 0 && !rep->fragment_timescale)
+           rep->fragment_timescale = 1;
+   This guard only triggers when fragment_duration > 0. If the attacker omits
+   the "duration" attribute from the SegmentTemplate (or sets it to 0),
+   fragment_duration stays 0 and fragment_timescale remains 0.
+
+2. length_of_each_segment == 0: Even if fragment_timescale is non-zero, when
+   timelines[i]->duration < fragment_timescale, integer division truncates
+   to 0, causing the second division (c->period_duration / 0) to crash.
+
+Both values (duration, timescale) are fully attacker-controlled via MPD XML
+attributes.
+
+=== Trigger Path ===
+
+dash_read_header()
+  -> parse_manifest()                 -- parses MPD, creates representations with timelines
+  -> open_demux_for_component()
+     -> calc_max_seg_no()  (line 1970) -- called when pls->last_seq_no == 0
+        -> division by zero at line 1469 or 1470
+
+The crash occurs during avformat_open_input() / header reading, so merely
+opening the malicious file is sufficient to trigger it.
+
+=== Conditions ===
+
+The attacker must craft an MPD manifest with:
+  - A SegmentTemplate containing a SegmentTimeline
+  - A <S> element with r="-1" (repeat = -1, meaning infinite repeat)
+  - No "timescale" attribute on the SegmentTemplate (fragment_timescale stays 0)
+  - No "duration" attribute on the SegmentTemplate (fragment_duration stays 0,
+    so the fallback at line 1094 does NOT set fragment_timescale = 1)
+  - OR: "timescale" set to a value larger than the <S d="..."> duration
+    (causing integer truncation to 0)
+
+=== Impact ===
+
+- Immediate process crash (SIGFPE) on any application using FFmpeg's libavformat
+  to open the crafted MPD file (ffmpeg, ffprobe, ffplay, VLC, any program using
+  libavformat).
+- Denial of service for media servers or transcoding pipelines that process
+  untrusted DASH streams.
+- The crash happens before any media data is fetched, during manifest parsing.
+
+=== Suggested Fix ===
+
+Add zero-checks before the divisions in calc_max_seg_no():
+
+    if (pls->timelines[i]->repeat == -1) {
+  +     if (!pls->fragment_timescale || !pls->timelines[i]->duration) {
+  +         av_log(NULL, AV_LOG_ERROR, "Invalid timescale or duration\n");
+  +         break;
+  +     }
+        int length_of_each_segment = pls->timelines[i]->duration / pls->fragment_timescale;
+  +     if (!length_of_each_segment) {
+  +         av_log(NULL, AV_LOG_ERROR, "Segment length is zero\n");
+  +         break;
+  +     }
+        num = c->period_duration / length_of_each_segment;
+    }
+
+=== Additional Notes ===
+
+Several related integer safety issues exist in this file:
+
+1. calc_cur_seg_no() (lines 1427-1435): Multiple divisions by
+   pls->fragment_duration without zero-checks in sub-branches.
+
+2. get_segment_start_time_based_on_timeline() called with cur_seq_no=0xFFFFFFFF
+   (line 1418) can cause excessive iteration / integer overflow when timeline
+   repeat counts are large.
+
+3. get_duration_insec() (line 253): Integer overflow in
+   ((days * 24 + hours) * 60 + mins) * 60 + secs with large attacker-controlled
+   values, wrapping the uint32_t result.

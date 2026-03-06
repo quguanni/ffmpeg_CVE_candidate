@@ -1,0 +1,95 @@
+VULNERABILITY: Heap Buffer Over-Read in joint_decode() via crafted js_subband_start
+====================================================================================
+
+File: libavcodec/cook.c
+Severity: HIGH
+Type: CWE-125 (Out-of-bounds Read)
+Impact: Information disclosure (heap data leak, potential ASLR bypass), potential crash
+
+SUMMARY
+-------
+A heap buffer over-read exists in the Cook audio decoder's joint_decode() function
+(line 851-856). When a crafted RealAudio stream specifies a large js_subband_start
+value relative to subbands, the interleaved channel-splitting loop reads far beyond
+the bounds of decode_buffer_0[1060], leaking up to ~3760 bytes of adjacent heap
+data (including pointers) into the audio output.
+
+ROOT CAUSE
+----------
+In joint_decode() at line 851-856, the first loop deinterleaves joint stereo data
+from decode_buffer into separate L/R channel buffers using stride 40 (2*SUBBAND_SIZE):
+
+    for (i = 0; i < p->js_subband_start; i++) {
+        for (j = 0; j < SUBBAND_SIZE; j++) {
+            mlt_buffer_left[i  * 20 + j] = decode_buffer[i * 40 + j];       // READ
+            mlt_buffer_right[i * 20 + j] = decode_buffer[i * 40 + 20 + j];  // READ
+        }
+    }
+
+decode_buffer points to q->decode_buffer_0 which has 1060 float elements (line 162).
+The maximum read index is: (js_subband_start - 1) * 40 + 20 + 19 = js_subband_start * 40 - 1
+
+For js_subband_start >= 27, this exceeds 1060:
+  - js_subband_start = 27: max index = 1079 (over-read by 20 floats = 80 bytes)
+  - js_subband_start = 50: max index = 1999 (over-read by 940 floats = 3760 bytes)
+
+MISSING VALIDATION
+------------------
+The initialization code (cook_decode_init) validates:
+  - js_subband_start < 51           (line 1123)
+  - subbands in [1, 50]             (lines 1227-1234)
+  - total_subbands <= 53            (line 1215)
+  - total_subbands = subbands + js_subband_start  (line 1165, joint stereo)
+
+But there is NO validation that js_subband_start <= subbands, or equivalently
+that js_subband_start * 2 <= total_subbands. This invariant is required for the
+stride-40 read pattern to stay within decode_buffer_0[1060].
+
+A valid-looking stream with js_subband_start=50, subbands=3 passes all checks:
+  total_subbands = 53 <= 53  (OK)
+  js_subband_start = 50 < 51 (OK)
+  subbands = 3 in [1, 50]    (OK)
+But the read goes to index 1999, far beyond the 1060-element buffer.
+
+WHAT GETS LEAKED
+----------------
+decode_buffer_0 is embedded in the COOKContext struct (line 162). Reading beyond
+it accesses the following adjacent struct fields (line 164-166):
+
+  1. cplscales[5]   - array of 5 pointers to static float tables
+                      -> leaks code/data segment addresses (ASLR bypass)
+  2. num_subpackets - integer
+  3. subpacket[5]   - array of COOKSubpacket structs, each containing:
+     - mono_previous_buffer1[1024] and mono_previous_buffer2[1024]
+       -> previous frame audio data
+     - gain arrays, VLC data, other decoder state
+
+Since all leaked data is within the COOKContext allocation, the read does not
+typically crash (no unmapped pages), making this a reliable info-leak primitive.
+The over-read data flows through IMDCT and audio processing into the output
+audio samples.
+
+TRIGGER CONDITIONS
+------------------
+1. Cook codec stream with JOINT_STEREO mode (cookversion = 0x1000003)
+2. extradata with js_subband_start >= 27
+3. subbands chosen so that subbands + js_subband_start <= 53
+4. channels = 2
+5. samples_per_frame yields valid samples_per_channel (256, 512, or 1024)
+
+FIX
+---
+Add a validation check in cook_decode_init after computing total_subbands:
+
+    if (q->subpacket[s].joint_stereo &&
+        q->subpacket[s].js_subband_start > q->subpacket[s].subbands) {
+        av_log(avctx, AV_LOG_ERROR,
+               "js_subband_start %d > subbands %d\n",
+               q->subpacket[s].js_subband_start,
+               q->subpacket[s].subbands);
+        return AVERROR_INVALIDDATA;
+    }
+
+Alternatively, increase decode_buffer_0 to 2120 elements (53*40) to accommodate
+the maximum stride-40 access pattern, though the validation fix is preferred as
+it rejects malformed streams early.

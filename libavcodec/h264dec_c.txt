@@ -1,0 +1,122 @@
+Vulnerability: Heap Buffer Over-Read in is_avcc_extradata()
+File: libavcodec/h264dec.c
+Lines: 898-920
+Severity: High (Information Disclosure / Denial of Service)
+Type: CWE-125 (Out-of-bounds Read)
+
+SUMMARY
+=======
+The function is_avcc_extradata() in libavcodec/h264dec.c contains a heap
+buffer over-read vulnerability. The function iterates through NAL units in a
+buffer without adequate bounds checking between the two parsing loops,
+allowing reads beyond the allocated buffer boundary.
+
+VULNERABLE CODE
+===============
+static int is_avcc_extradata(const uint8_t *buf, int buf_size)
+{
+    int cnt= buf[5]&0x1f;            // (1) cnt can be 1-31
+    const uint8_t *p= buf+6;
+    if (!cnt)
+        return 0;
+    while(cnt--){
+        int nalsize= AV_RB16(p) + 2;
+        if(nalsize > buf_size - (p-buf) || (p[2] & 0x9F) != 7)
+            return 0;
+        p += nalsize;                // (2) p can reach exactly buf+buf_size
+    }
+    cnt = *(p++);                    // (3) OOB READ: p may be at buf+buf_size
+    if(!cnt)
+        return 0;
+    while(cnt--){
+        int nalsize= AV_RB16(p) + 2; // (4) OOB READ: p is past buf+buf_size
+        if(nalsize > buf_size - (p-buf) || (p[2] & 0x9F) != 8)
+            return 0;
+        p += nalsize;
+    }
+    return 1;
+}
+
+ROOT CAUSE
+==========
+The first while loop processes SPS NAL units. The bounds check within the loop
+ensures that `p + nalsize <= buf + buf_size`, meaning after the loop `p` can
+be exactly at `buf + buf_size` (i.e., one byte past the last valid byte).
+
+At marker (3), `cnt = *(p++)` dereferences `p` which may already be at or
+beyond the buffer end. This is a heap buffer over-read of at least 1 byte.
+
+If the OOB-read byte at (3) is non-zero, the second while loop at (4) then
+calls `AV_RB16(p)` which reads 2 more bytes out of bounds, and `p[2]` reads
+a 3rd byte out of bounds. This extends the over-read to up to 3+ bytes past
+the buffer.
+
+There is NO bounds check between the two loops to verify that `p` is still
+within [buf, buf+buf_size).
+
+CALL PATH
+=========
+The function is reached via:
+  h264_decode_frame() [line 1044-1048]
+    -> is_avcc_extradata(buf, buf_size)
+
+The call site only guarantees buf_size >= 9:
+    if (h->is_avc && buf_size >= 9 && buf[0]==1 && buf[2]==0 && (buf[4]&0xFC)==0xFC) {
+        if (is_avcc_extradata(buf, buf_size))
+
+A crafted 9-byte packet with buf[5] = 1 (cnt=1), a 2-byte SPS NAL
+(AV_RB16(buf+6) = 0, so nalsize = 2), and p[2]=0x67 (matching 0x9F mask == 7)
+will cause p to advance to buf+8 after the first loop. Then `cnt = *(p++)`
+reads buf[8] (still in bounds for 9-byte buffer), but if cnt != 0 the
+second loop reads AV_RB16 at buf+9 which is OUT OF BOUNDS.
+
+With slightly larger crafted inputs, the first loop can consume the entire
+buffer, making even the `cnt = *(p++)` read itself out of bounds.
+
+IMPACT
+======
+1. Information Disclosure: The OOB read can leak adjacent heap memory contents.
+   In contexts where FFmpeg output is observable (e.g., transcoding services),
+   this could leak sensitive data from co-located heap allocations.
+
+2. Denial of Service: Reading unmapped memory can cause a segmentation fault,
+   crashing the application.
+
+3. The vulnerability is triggered by a crafted H.264 input packet, making it
+   remotely exploitable in any application that uses FFmpeg/libavcodec to
+   decode untrusted H.264 video (media players, streaming servers, transcoding
+   services, browser media engines).
+
+SUGGESTED FIX
+=============
+Add bounds checks before each read of `p`:
+
+static int is_avcc_extradata(const uint8_t *buf, int buf_size)
+{
+    int cnt= buf[5]&0x1f;
+    const uint8_t *p= buf+6;
+    if (!cnt)
+        return 0;
+    while(cnt--){
++       if (buf_size - (p - buf) < 3)  // need at least 3 bytes for AV_RB16 + p[2]
++           return 0;
+        int nalsize= AV_RB16(p) + 2;
+        if(nalsize > buf_size - (p-buf) || (p[2] & 0x9F) != 7)
+            return 0;
+        p += nalsize;
+    }
++   if (p >= buf + buf_size)           // bounds check before reading PPS count
++       return 0;
+    cnt = *(p++);
+    if(!cnt)
+        return 0;
+    while(cnt--){
++       if (buf_size - (p - buf) < 3)
++           return 0;
+        int nalsize= AV_RB16(p) + 2;
+        if(nalsize > buf_size - (p-buf) || (p[2] & 0x9F) != 8)
+            return 0;
+        p += nalsize;
+    }
+    return 1;
+}

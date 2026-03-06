@@ -1,0 +1,124 @@
+Vulnerability: Integer Overflow in NUT Demuxer Frame Size Calculation Combined
+with Operator Precedence Bug Bypassing Safety Validation
+
+File: libavformat/nutdec.c
+Severity: High (Denial of Service / Potential Memory Corruption)
+Functions: decode_frame_header() (line 1039), decode_frame() (line 1079)
+
+=== Root Cause ===
+
+1. INTEGER OVERFLOW IN FRAME SIZE (line 1039):
+
+In decode_frame_header(), the frame size is computed as:
+
+    int size, flags, size_mul, pts_delta, i, reserved_count, ret;  // line 1002
+    ...
+    size     = nut->frame_code[frame_code].size_lsb;               // line 1015
+    ...
+    if (flags & FLAG_SIZE_MSB)
+        size += size_mul * ffio_read_varlen(bc);                    // line 1039
+
+The variable `size` is declared as `int` (32-bit). The expression
+`size_mul * ffio_read_varlen(bc)` multiplies an `int` by an `int64_t`,
+producing an `int64_t` result. However, when this result is added to `size`
+(an `int`) and stored back into `size`, the value is truncated to 32 bits.
+
+An attacker can craft size_mul and the varlen-encoded value in the stream such
+that their product, when truncated to 32 bits, produces any arbitrary int value.
+For example, size_mul=1 and varlen=0x100000000 + desired_value will truncate to
+desired_value. This gives the attacker full control over the effective frame size.
+
+2. OPERATOR PRECEDENCE BUG IN SAFETY CHECK (lines 1064-1066):
+
+    } else if (!(nut->flags & NUT_PIPE) &&
+               size > 2 * nut->max_distance ||
+               FFABS(stc->last_pts - *pts) > stc->max_pts_distance) {
+
+Due to C operator precedence, && binds tighter than ||. This parses as:
+
+    (!(nut->flags & NUT_PIPE) && (size > 2*max_distance)) ||
+    (FFABS(stc->last_pts - *pts) > stc->max_pts_distance)
+
+The intended logic was:
+
+    !(nut->flags & NUT_PIPE) &&
+    ((size > 2*max_distance) || (FFABS(stc->last_pts - *pts) > stc->max_pts_distance))
+
+Consequence: When NUT_PIPE is set (attacker-controlled via the main header flags
+field at line 349), the size validation check `size > 2 * max_distance` is
+completely bypassed. Only the pts distance check remains, and if the attacker
+crafts pts values to be close together, the ENTIRE safety check evaluates to
+false. This allows arbitrarily large frames without FLAG_CHECKSUM to pass
+through unvalidated.
+
+=== Attack Scenario ===
+
+An attacker crafts a malicious NUT file with:
+
+1. Main header with NUT_PIPE flag (0x2) set in the flags field, and version > 3
+   (to enable the flags field parsing at line 348-349).
+
+2. Frame code table entries with FLAG_SIZE_MSB set, a chosen size_mul, and no
+   FLAG_CHECKSUM.
+
+3. Frame data containing a varlen-encoded size_msb value that, when multiplied
+   by size_mul and truncated to 32-bit int, produces a very large positive value
+   (e.g., close to INT_MAX / 2).
+
+4. Syncpoint with pts values crafted to keep pts_delta within max_pts_distance,
+   bypassing the precedence-bugged safety check.
+
+=== Impact ===
+
+- Denial of Service: The attacker-controlled large size is passed to
+  av_new_packet(pkt, size + header_len) in decode_frame() at line 1108, causing
+  allocation of an arbitrarily large heap buffer (up to ~2GB). Repeated frames
+  cause memory exhaustion.
+
+- Stream Desynchronization: If the integer overflow produces a size smaller than
+  the actual frame data, the stream position after the frame read is incorrect.
+  Subsequent frames are parsed starting at wrong offsets, causing arbitrary data
+  to be interpreted as frame headers and fed to audio/video decoders. This can
+  trigger secondary vulnerabilities in downstream codec implementations.
+
+- The NUT_PIPE flag bypass (via the precedence bug) removes the max_distance
+  safety limit that would normally catch anomalous frame sizes when checksums
+  are absent, making the integer overflow directly exploitable.
+
+=== Additional Issue: Uninitialized Heap Memory Disclosure (lines 966-979) ===
+
+In read_sm_data(), AV_PKT_DATA_PARAM_CHANGE side data is allocated as 16 bytes
+but only 8-12 bytes may be written depending on which parameters are present:
+
+    uint8_t *dst = av_packet_new_side_data(pkt, AV_PKT_DATA_PARAM_CHANGE, 16);
+    bytestream_put_le32(&dst, flags);          // 4 bytes always
+    if (sample_rate) bytestream_put_le32(..);  // 4 bytes conditional
+    if (width||height) { put(width); put(height); } // 8 bytes conditional
+
+When only sample_rate OR only width/height is set, 4-8 bytes of uninitialized
+heap memory remain in the side data buffer and are exposed to the application,
+constituting an information disclosure vulnerability.
+
+=== Fix ===
+
+1. Change `size` to `int64_t` in decode_frame_header(), or add an overflow
+   check after the multiplication at line 1039:
+
+     if (flags & FLAG_SIZE_MSB) {
+         int64_t msb = (int64_t)size_mul * ffio_read_varlen(bc);
+         if (msb > INT_MAX - size || msb < INT_MIN - size)
+             return AVERROR_INVALIDDATA;
+         size += msb;
+     }
+
+2. Add parentheses to fix operator precedence at lines 1064-1066:
+
+     } else if (!(nut->flags & NUT_PIPE) &&
+                (size > 2 * nut->max_distance ||
+                 FFABS(stc->last_pts - *pts) > stc->max_pts_distance)) {
+
+3. Zero-initialize the PARAM_CHANGE side data buffer:
+
+     uint8_t *dst = av_packet_new_side_data(pkt, AV_PKT_DATA_PARAM_CHANGE, 16);
+     if (!dst) return AVERROR(ENOMEM);
+     memset(dst, 0, 16);

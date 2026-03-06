@@ -1,0 +1,68 @@
+Vulnerability: Unsigned Integer Underflow in populate_distribution() Leading to ANS Decoder State Corruption
+
+File: libavcodec/jpegxl_parser.c
+Function: populate_distribution() (line 383) and downstream read_ans_symbol() (line 308)
+Severity: High (Denial of Service / potential code execution)
+Type: CWE-191 Integer Underflow, CWE-20 Missing Input Validation
+
+SUMMARY:
+In populate_distribution(), the total_count variable accumulates ANS symbol frequencies
+from a crafted bitstream without validating that the sum does not exceed (1 << 12) = 4096.
+The omitted symbol's frequency is then computed as:
+
+    dist->freq[omit_pos] = (1 << 12) - total_count;   (line 478)
+
+When total_count > 4096, this unsigned subtraction underflows, producing a very large
+uint32_t value (e.g., 0xFFFFFFFE). This corrupted frequency is subsequently used in
+read_ans_symbol() to update the ANS decoder state:
+
+    dec->state = dist->freq[symbol] * (dec->state >> 12) + offset;   (line 320)
+
+The huge freq value causes the state computation to overflow, corrupting the decoder state
+and leading to unpredictable behavior in all subsequent symbol decoding.
+
+ROOT CAUSE:
+The JPEG XL ANS coding specification requires that all symbol frequencies sum to exactly
+(1 << 12) = 4096. One symbol (omit_pos) has its frequency derived as the remainder.
+However, the code does not validate that the sum of all other frequencies <= 4096 before
+computing the remainder via unsigned subtraction.
+
+An attacker can craft a bitstream where three or more symbols have logcount values of 12
+(the maximum). Each such symbol contributes at least 2048 to total_count. With just two
+non-omitted symbols at logcount=12, total_count >= 4096, and with extra bits it easily
+exceeds 4096.
+
+TRIGGER PATH:
+1. A crafted JXL bitstream reaches parse_frame_header() -> entropy_decoder_init() ->
+   read_distribution_bundle() -> populate_distribution()
+2. In populate_distribution(), the crafted ANS distribution has alphabet_size >= 4 with
+   three or more symbols having logcounts[i] = 12 (read from dist_prefix_table)
+3. omit_pos is set to the first symbol with the highest logcount (12)
+4. The second loop (lines 458-477) accumulates frequencies for all non-omitted symbols
+   into total_count; with multiple logcount=12 symbols, total_count > 4096
+5. Line 478: dist->freq[omit_pos] = (1 << 12) - total_count underflows
+6. gen_alias_map() receives the corrupted frequency table. It may succeed if uint16_t
+   truncation of the huge freq value happens to balance the alias buckets, OR it may
+   return AVERROR_INVALIDDATA. If it succeeds, the mapping is subtly corrupted.
+7. read_ans_symbol() uses the corrupted dist->freq[symbol] in state computation,
+   causing state overflow. Corrupted state leads to arbitrary symbol values in
+   subsequent decoding, which can trigger further out-of-bounds accesses, infinite
+   loops, or memory corruption in higher-level parsing functions.
+
+IMPACT:
+- Denial of Service: corrupted ANS decoder state causes unpredictable parsing behavior,
+  including potential infinite loops or crashes
+- Potential memory corruption: corrupted symbol values from the ANS decoder can cause
+  out-of-bounds reads/writes in callers that use decoded symbols as array indices
+  (e.g., cluster_map indexing at line 348, LZ77 window access at line 337)
+- The vulnerability is reachable from any JXL input processing path (parser, decoder)
+
+FIX:
+Add a validation check after the frequency accumulation loop:
+
+    if (total_count > (1 << 12))
+        return AVERROR_INVALIDDATA;
+
+    dist->freq[omit_pos] = (1 << 12) - total_count;
+
+This ensures the omitted symbol's frequency is non-negative and the total is exactly 4096.

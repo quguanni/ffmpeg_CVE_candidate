@@ -1,0 +1,132 @@
+VULNERABILITY: Heap Out-of-Bounds Read via ID3v2.3 Frame Flag Misinterpretation
+================================================================================
+
+File: libavformat/id3v2.c
+Severity: High (CVSS ~7.5)
+CWE: CWE-393 (Return of Wrong Status Code), CWE-131 (Incorrect Calculation of Buffer Size)
+
+SUMMARY
+-------
+The ID3v2 parser uses ID3v2.4 frame flag bit positions when parsing ID3v2.3
+tags. Since ID3v2.3 and ID3v2.4 define completely different bit layouts for
+frame flags, this causes multiple misinterpretations that can be triggered by
+a crafted file:
+
+  ID3v2.3 spec:  flags = %abc00000 %ijk00000
+    i (0x0080) = Compression
+    j (0x0040) = Encryption
+    k (0x0020) = Grouping identity
+
+  ID3v2.4 spec:  flags = %0abc0000 %0h00kmnp
+    k (0x0008) = Compression
+    m (0x0004) = Encryption
+    n (0x0002) = Unsynchronisation
+    p (0x0001) = Data length indicator
+
+  Code (id3v2.h lines 37-40, used for ALL versions):
+    #define ID3v2_FLAG_DATALEN     0x0001
+    #define ID3v2_FLAG_UNSYNCH     0x0002
+    #define ID3v2_FLAG_ENCRYPTION  0x0004
+    #define ID3v2_FLAG_COMPRESSION 0x0008
+
+EXPLOITABLE CONSEQUENCES
+------------------------
+
+1) ENCRYPTED FRAME BYPASS (most severe):
+   An ID3v2.3 encrypted frame has flag bit 0x0040 set. The code checks bit
+   0x0004 (ID3v2_FLAG_ENCRYPTION). Since these don't overlap, the encryption
+   is NOT detected and the encrypted/opaque binary data is passed directly to
+   tag content parsers (read_ttag, read_geobtag, read_apic, etc.).
+
+   At id3v2.c line 972:
+     if (tencr || (!CONFIG_ZLIB && tcomp)) {
+       // SKIP: this branch is NOT taken for v2.3 encrypted frames
+     }
+
+   The encrypted binary data is then parsed as structured tag content. When
+   parsed as a GEOB frame, the unsigned int conversion bug at line 524:
+     if ((len = avio_read(pb, geob_data->data, taglen)) < taglen)
+   converts a negative avio_read error return to a huge unsigned int stored in
+   geob_data->datasize, causing consumers to read far beyond the allocated
+   heap buffer.
+
+2) FALSE COMPRESSION/DATALEN TRIGGERING:
+   A crafted ID3v2.3 frame with bits 0-3 set in the format flags byte
+   (undefined/reserved in v2.3) triggers ID3v2.4 code paths:
+   - Bit 0 (0x0001): False data length indicator — 4 bytes of frame content
+     are consumed as "dlen", misaligning all subsequent parsing
+   - Bit 3 (0x0008): False compression — frame data is passed to zlib
+     uncompress() as if it were compressed
+
+   With flags = 0x0009, an attacker controls both:
+   a) The dlen value (controls uncompressed buffer allocation size)
+   b) The data passed to uncompress (can embed valid zlib payloads)
+
+   This allows controlled zlib decompression of attacker-supplied data with
+   attacker-controlled output buffer size (dlen). While uncompress() itself
+   limits writes to dlen, the resulting decompressed data is passed to
+   ffio_init_read_context() which takes `int buffer_size` (line 98 of
+   aviobuf.c) while dlen is `unsigned long`. On 64-bit systems, if dlen
+   exceeds INT_MAX after decompression, the buffer_size wraps negative,
+   causing buf_end to point before the buffer start.
+
+3) COMPRESSED FRAME BYPASS:
+   Real ID3v2.3 compressed frames (flag 0x0080) are NOT detected as
+   compressed (code checks 0x0008). Raw zlib-compressed binary data is
+   passed to tag parsers as plaintext, causing misinterpretation of binary
+   data as tag encoding/content.
+
+SECONDARY BUG: Signed/Unsigned Mismatch in read_geobtag
+--------------------------------------------------------
+At id3v2.c line 524:
+  if ((len = avio_read(pb, geob_data->data, taglen)) < taglen)
+
+`len` is declared as `unsigned int` (line 483) but `avio_read` returns `int`.
+If avio_read returns a negative error code (e.g., AVERROR_EOF = -541478725),
+the assignment wraps it to unsigned: len = 0xDFB9B0BB (~3.75 billion).
+The comparison `0xDFB9B0BB < taglen` is false for any normal taglen, so the
+error goes UNDETECTED. Then geob_data->datasize = 0xDFB9B0BB is stored.
+
+Any code consuming GEOB extra metadata using datasize would perform a massive
+out-of-bounds heap read.
+
+This secondary bug is reachable via the primary vulnerability: when v2.3
+encrypted frame data is falsely parsed as a GEOB frame, the binary content
+causes decode_str to consume unexpected amounts of data, and avio_read
+on the remainder can fail, triggering the unsigned wrap.
+
+ROOT CAUSE
+----------
+id3v2_parse() at line 936-969 applies the same flag constants (defined for
+v2.4) regardless of whether version==3 or version==4. There is no
+version-conditional flag remapping for v2.3's different bit layout.
+
+AFFECTED VERSIONS
+-----------------
+All FFmpeg versions containing this ID3v2 parser code. The flag definitions
+and their usage have remained unchanged since the compressed frame support
+was added.
+
+FIX
+---
+Add version-conditional flag parsing in id3v2_parse():
+
+  if (isv34) {
+      tflags = avio_rb16(pb);
+      if (version == 3) {
+          // Remap v2.3 flags to internal representation
+          tunsync = 0; // v2.3 has no per-frame unsync
+          tcomp   = tflags & 0x0080;
+          tencr   = tflags & 0x0040;
+          // v2.3 compressed frames include decompressed size in data
+          if (tcomp) dlen_in_data = 1;
+      } else {
+          tunsync = tflags & ID3v2_FLAG_UNSYNCH;
+          tcomp   = tflags & ID3v2_FLAG_COMPRESSION;
+          tencr   = tflags & ID3v2_FLAG_ENCRYPTION;
+      }
+  }
+
+Also fix the unsigned int mismatch in read_geobtag:
+  int len;  // change from unsigned int to int
+  if ((len = avio_read(pb, geob_data->data, taglen)) < 0 || len < taglen)

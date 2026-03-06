@@ -1,0 +1,165 @@
+===============================================================================
+CVE Candidate: Heap Buffer Over-Read in vc1_parse_sprites() via Late
+               Bounds Checking (libavcodec/vc1dec.c)
+===============================================================================
+
+Severity: HIGH (CVSS ~7.1 — heap over-read, remote trigger via crafted media)
+Type:     CWE-125 (Out-of-bounds Read) / CWE-787 potential OOB Write consequence
+Affected: FFmpeg libavcodec — WMV3IMAGE / VC1IMAGE sprite decoder path
+
+===============================================================================
+1. SUMMARY
+===============================================================================
+
+In libavcodec/vc1dec.c, the function vc1_parse_sprites() reads an unbounded
+number of bits from the input bitstream BEFORE performing a buffer overrun
+check at line 199. When processing a crafted, truncated WMV3IMAGE/VC1IMAGE
+packet, the bitstream reader functions (get_bits_long, get_fp_val, etc.)
+read far past the end of the packet data + AV_INPUT_BUFFER_PADDING_SIZE
+(64 bytes), causing a heap buffer over-read of up to ~87 bytes beyond the
+padded allocation.
+
+===============================================================================
+2. ROOT CAUSE ANALYSIS
+===============================================================================
+
+File: libavcodec/vc1dec.c
+
+The vulnerable flow is:
+
+  vc1_decode_frame()
+    → line 986-987: reads new_sprite, two_sprites from bitstream
+    → line 998: if new_sprite==0, goto image (skipping all frame decode)
+    → line 1362: vc1_decode_sprites(v, &v->gb)
+      → line 316: vc1_parse_sprites(v, gb, &sd)
+
+Inside vc1_parse_sprites() (lines 139-208):
+
+  (a) Lines 144-154: For each sprite (up to 2 when two_sprites=1),
+      vc1_sprite_parse_transform() is called, which reads up to 213 bits
+      per transform from the bitstream via get_fp_val() → get_bits_long(gb,30).
+
+  (b) Lines 156-194: Effect parameters are parsed:
+      - effect_type:   30 bits (line 157)
+      - effect_pcount1: 4 bits (line 158), then up to 426 bits of params
+      - effect_pcount2: 16 bits (line 180), then up to 310 bits of params
+      - effect_flag:    1 bit (line 196)
+
+  (c) Lines 199-203: ONLY NOW is the buffer overrun check performed:
+
+      if (get_bits_count(gb) >= gb->size_in_bits +
+         (avctx->codec_id == AV_CODEC_ID_WMV3IMAGE ? 64 : 0)) {
+          av_log(avctx, AV_LOG_ERROR, "Buffer overrun\n");
+          return AVERROR_INVALIDDATA;
+      }
+
+WORST-CASE BITS READ (before the check):
+  - 2 sprite transforms:           2 × 213 = 426 bits
+  - skip_bits(gb, 2):                          2 bits
+  - effect_type:                               30 bits
+  - effect_pcount1:                             4 bits
+  - case 14 (two transforms):     2 × 213 = 426 bits
+  - effect_pcount2:                            16 bits
+  - 10 effect_params2 values:     10 × 31 = 310 bits
+  - effect_flag:                                1 bit
+  ─────────────────────────────────────────────────────
+  TOTAL:                                    1,215 bits = ~152 bytes
+
+For the WMV3/WMV3IMAGE path (line 979-982), the bitstream is initialized
+directly from the raw packet buffer:
+
+    ret = init_get_bits8(&v->gb, buf, buf_size);
+
+The packet buffer has AV_INPUT_BUFFER_PADDING_SIZE (64) bytes of zero
+padding after the data. For a packet of size N bytes:
+
+    Total safely readable: N + 64 = N + 64 bytes
+    Maximum read by vc1_parse_sprites: ~152 bytes
+
+    Over-read = 152 - (N + 64) bytes past allocation
+
+For a minimal 1-byte packet (N=1):
+    Over-read = 152 - 65 = 87 bytes past allocation → HEAP OVER-READ
+
+The GetBitContext cached reader fetches data in 4-byte or 8-byte chunks
+via direct pointer dereference. Once the fetch address exceeds
+buffer + size + AV_INPUT_BUFFER_PADDING_SIZE, it reads from unallocated
+heap memory, causing:
+
+  1. Information disclosure (sensitive heap data leaked into sprite coefs)
+  2. Denial of service (crash if the address is unmapped)
+  3. Potential exploitation as a heap info-leak primitive for further attacks
+
+===============================================================================
+3. TRIGGER CONDITIONS
+===============================================================================
+
+The vulnerability is triggered when ALL of the following hold:
+
+  1. Codec is WMV3IMAGE (AV_CODEC_ID_WMV3IMAGE) or VC1IMAGE
+     (AV_CODEC_ID_VC1IMAGE)
+
+  2. A valid sequence header was parsed during codec init (so v->res_sprite
+     is set and sprite dimensions are configured)
+
+  3. A frame packet is received where:
+     - Bit 0 = 1 → new_sprite = !1 = 0 (not a new sprite)
+     - Bit 1 = 1 → two_sprites = 1 (two-sprite mode, maximizes reads)
+     - Remaining packet data is very short (< ~88 bytes)
+
+  4. The goto image path is taken (line 998), bypassing frame decode,
+     directly entering vc1_decode_sprites → vc1_parse_sprites
+
+  5. vc1_parse_sprites reads up to 1215 bits, exceeding the buffer + padding
+
+===============================================================================
+4. AFFECTED CODE LINES
+===============================================================================
+
+libavcodec/vc1dec.c:
+  - Line 139-208: vc1_parse_sprites() — all bitstream reads before line 199
+  - Line 144-154: sprite transform parsing (2 transforms × 213 bits)
+  - Line 157-194: effect parameter parsing (up to ~789 bits)
+  - Line 199-203: late buffer overrun check (too late — damage already done)
+  - Line 986-998:  vc1_decode_frame() trigger path (goto image on new_sprite=0)
+
+===============================================================================
+5. SUGGESTED FIX
+===============================================================================
+
+Move the buffer bounds check BEFORE the parsing loop, or add incremental
+checks after each major bitstream read:
+
+--- a/libavcodec/vc1dec.c
++++ b/libavcodec/vc1dec.c
+@@ -139,6 +139,12 @@ static int vc1_parse_sprites(VC1Context *v, GetBitContext* gb, SpriteData* sd)
+     AVCodecContext *avctx = v->s.avctx;
+     int sprite, i;
+
++    /* Ensure minimum bits available for sprite transform data */
++    if (get_bits_left(gb) < 2 + (1 + v->two_sprites) * 100) {
++        av_log(avctx, AV_LOG_ERROR, "Sprite data too short\n");
++        return AVERROR_INVALIDDATA;
++    }
++
+     for (sprite = 0; sprite <= v->two_sprites; sprite++) {
+         vc1_sprite_parse_transform(gb, sd->coefs[sprite]);
+
+Additionally, add get_bits_left() checks before each major parsing section
+(effect_type, effect_params1, effect_params2) to prevent over-reads.
+
+===============================================================================
+6. IMPACT ASSESSMENT
+===============================================================================
+
+- Attack Vector: Network (crafted media file)
+- Attack Complexity: Low (trivial to craft a short packet)
+- Privileges Required: None (victim just opens a file)
+- User Interaction: Required (open media file)
+- Confidentiality Impact: High (heap data disclosure)
+- Integrity Impact: None (read-only over-read)
+- Availability Impact: High (crash/DoS)
+
+Any application using FFmpeg to decode WMV3IMAGE or VC1IMAGE content
+(media players, transcoders, web services) is affected. The vulnerability
+can be triggered remotely by serving a crafted .wmv or .asf file.

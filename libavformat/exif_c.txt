@@ -1,0 +1,91 @@
+Vulnerability: Integer Overflow in exif_clone_entry() Leading to Heap Buffer Over-Read/Overflow
+File: libavcodec/exif.c
+Severity: HIGH (CVSS ~8.1)
+CWE: CWE-190 (Integer Overflow) -> CWE-122 (Heap Buffer Overflow) / CWE-126 (Buffer Over-Read)
+
+=== Root Cause ===
+
+In exif_clone_entry() at line 1143:
+
+    case AV_TIFF_STRING:
+        dst->value.str = av_memdup(src->value.str, src->count+1);
+
+The expression `src->count + 1` is computed in uint32_t arithmetic. When src->count
+is UINT32_MAX (0xFFFFFFFF), the addition overflows to 0. This causes av_memdup() to
+allocate a minimal buffer (1 byte via av_malloc(0)) while dst->count remains 0xFFFFFFFF.
+
+Note that the EXIF_COPY macro used for all OTHER types (BYTE, SHORT, LONG, etc.) is
+protected by av_size_mult() which correctly detects overflow. The STRING case at line
+1143 bypasses this safe pattern and uses a raw `count+1` without overflow checking.
+
+=== Contrast with Safe Code ===
+
+The EXIF_COPY macro (line 1074-1085) correctly uses av_size_mult() for overflow-safe
+size computation:
+
+    #define EXIF_COPY(fname, srcname) do { \
+        size_t sz; \
+        if (av_size_mult(src->count, sizeof(*(fname)), &sz) < 0) { \
+            ret = AVERROR(ENOMEM); \
+            goto end; \
+        } \
+        (fname) = av_memdup((srcname), sz); \
+    } while (0)
+
+The STRING case does NOT use this safe pattern.
+
+=== Impact ===
+
+1. HEAP BUFFER OVER-READ (64-bit and 32-bit):
+   When the cloned entry is later written via exif_write_values() (line 410):
+
+       case AV_TIFF_STRING:
+           bytestream2_put_buffer(pb, entry->value.str, entry->count);
+
+   bytestream2_put_buffer() calls memcpy() reading min(output_buffer_remaining, 0xFFFFFFFF)
+   bytes from the 1-byte entry->value.str allocation. This reads heap memory far beyond
+   the allocation boundary, leaking sensitive data or crashing.
+
+2. HEAP BUFFER OVERFLOW (32-bit platforms):
+   exif_get_ifd_size() computes:
+       payload_size = entry->count * exif_sizes[entry->type]  // 0xFFFFFFFF * 1
+
+   On 32-bit size_t, the accumulated total_size overflows to a small value. av_exif_write()
+   then allocates an undersized buffer. The subsequent exif_write_ifd() writes beyond the
+   allocated buffer. Critically, line 737:
+
+       AV_WN32(pb->buffer, 0);
+
+   performs a RAW 4-byte write that bypasses PutByteContext bounds checking, enabling
+   controlled heap corruption.
+
+3. INFORMATION DISCLOSURE via exif_ifd_to_dict() (line 1015):
+       av_bprintf(&bp, "%s", entry->value.str);
+
+   Reads from the 1-byte allocation as a C string until a null byte is found in
+   adjacent heap memory, leaking heap contents into metadata dictionary strings.
+
+=== Trigger Path ===
+
+The public API function av_exif_set_entry() (line 1194) accepts a uint32_t count
+parameter with NO validation on the count value for STRING type. It calls
+exif_clone_entry() internally. Any code that passes attacker-influenced count values
+to av_exif_set_entry() with type=AV_TIFF_STRING triggers this vulnerability.
+
+The parsing path (exif_decode_tag) limits count to < INT_MAX/8 (~268M), which prevents
+the overflow from crafted EXIF input alone. However, any intermediate processing layer
+that constructs EXIF entries from external data using the av_exif_set_entry() API is
+vulnerable.
+
+=== Fix ===
+
+Replace line 1143:
+    dst->value.str = av_memdup(src->value.str, src->count+1);
+
+With overflow-safe computation:
+    size_t str_size;
+    if (av_size_mult(src->count, 1, &str_size) < 0 || str_size > SIZE_MAX - 1) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    dst->value.str = av_memdup(src->value.str, str_size + 1);

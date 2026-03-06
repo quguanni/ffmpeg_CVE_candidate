@@ -1,0 +1,100 @@
+Vulnerability: Heap Buffer Over-Read in Dirac Low Delay Slice Parsing
+======================================================================
+
+File: libavcodec/diracdec.c
+Severity: HIGH (CVSS ~7.5)
+CWE: CWE-125 (Out-of-bounds Read)
+Impact: Information Disclosure / Denial of Service (crash)
+
+Summary
+-------
+A heap buffer over-read vulnerability exists in the Dirac decoder's low delay
+slice parsing code (decode_lowdelay). A crafted Dirac/VC-2 bitstream can cause
+the decoder to read heap memory located before the input buffer, potentially
+leaking sensitive data into the decoded video output or causing a crash.
+
+Root Cause
+----------
+In dirac_unpack_idwt_params() at line 1287, the lowdelay.bytes.num field is
+assigned directly from get_interleaved_ue_golomb(), which returns an unsigned
+int. However, lowdelay.bytes is an AVRational (with int num, int den).
+
+    s->lowdelay.bytes.num = get_interleaved_ue_golomb(gb);  // line 1287
+    s->lowdelay.bytes.den = get_interleaved_ue_golomb(gb);  // line 1288
+
+When the golomb-coded value exceeds INT_MAX (2147483647), the unsigned-to-signed
+conversion wraps the value to a negative integer. Only bytes.den is validated
+(line 1289: den <= 0 check). There is NO validation that bytes.num is positive.
+
+In decode_lowdelay() at lines 1013-1030, the per-slice byte count is computed:
+
+    bytes = (slice_num+1) * (int64_t)s->lowdelay.bytes.num / s->lowdelay.bytes.den
+           - slice_num    * (int64_t)s->lowdelay.bytes.num / s->lowdelay.bytes.den;
+
+When bytes.num is negative (e.g., -1 from unsigned 0xFFFFFFFF), bytes evaluates
+to -1 for each slice. The subsequent bounds checks at line 1015 FAIL to catch
+this:
+
+    if (bytes >= INT_MAX || bytes*8 > bufsize)  // line 1015
+
+- bytes >= INT_MAX  →  -1 >= 2147483647  →  FALSE
+- bytes*8 > bufsize →  -8 > positive     →  FALSE
+
+Both checks pass, and the code proceeds with a negative slice size.
+
+Exploitation
+------------
+After the failed checks, the following operations corrupt the buffer pointer:
+
+    buf += bytes;           // line 1025: moves buf BACKWARD (before buffer start)
+    bufsize -= bytes*8;     // line 1027: INCREASES bufsize (subtracting negative)
+
+This repeats for each of the num_x * num_y slices. After N slices:
+  - buf has moved N bytes before the start of the input buffer
+  - bufsize has grown by 8*N bits beyond its original value
+
+Each slice calls init_get_bits() with this corrupted (buf, bufsize), and
+decode_lowdelay_slice() reads from this out-of-bounds GetBitContext. The data
+read from the heap before the buffer is decoded as wavelet coefficients and
+ends up in the output video frame, constituting an information disclosure.
+
+If buf is moved far enough back to point to unmapped memory, the decoder
+crashes (denial of service).
+
+Attack Vector
+-------------
+1. Craft a Dirac bitstream with a valid sequence header
+2. Include a picture data unit with parse_code indicating Low Delay mode
+   (parse_code & 0xF8 == 0xC8, e.g., parse_code = 0xC8)
+3. In the wavelet transform parameters (dirac_unpack_idwt_params), encode
+   lowdelay.bytes.num as an interleaved exp-golomb value > INT_MAX
+   (e.g., 0x80000000 = 2147483648, which wraps to -2147483648 as int)
+4. Set lowdelay.bytes.den to 1 (valid positive value)
+5. The decoder processes num_x * num_y slices, each moving the read pointer
+   backward by 1 byte and increasing the buffer size
+
+Affected Code Path
+------------------
+dirac_decode_frame()                    (line 2267)
+  → dirac_decode_data_unit()            (line 2122)
+    → dirac_decode_picture_header()     (line 1999)
+      → dirac_unpack_idwt_params()      (line 1233) ← bytes.num set to negative
+    → dirac_decode_frame_internal()     (line 1872)
+      → decode_lowdelay()               (line 933)  ← OOB read triggered
+
+Suggested Fix
+-------------
+Add a validation check for lowdelay.bytes.num after line 1288:
+
+    s->lowdelay.bytes.num = get_interleaved_ue_golomb(gb);
+    s->lowdelay.bytes.den = get_interleaved_ue_golomb(gb);
++   if (s->lowdelay.bytes.den <= 0 || s->lowdelay.bytes.num <= 0) {
+-   if (s->lowdelay.bytes.den <= 0) {
+        av_log(s->avctx,AV_LOG_ERROR,"Invalid lowdelay.bytes.den\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+Additionally, add a check for negative bytes in decode_lowdelay():
+
+    if (bytes >= INT_MAX || bytes*8 > bufsize) {
++   if (bytes <= 0 || bytes >= INT_MAX || bytes*8 > bufsize) {

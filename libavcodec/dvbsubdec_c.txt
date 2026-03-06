@@ -1,0 +1,101 @@
+Vulnerability: Heap Buffer Over-Read in dvbsub_parse_pixel_data_block() via Map Table Updates
+File: libavcodec/dvbsubdec.c
+Severity: HIGH (CVSS ~7.5 - heap info leak / denial of service)
+Type: CWE-125 (Out-of-bounds Read)
+
+================================================================================
+DESCRIPTION
+================================================================================
+
+In dvbsub_parse_pixel_data_block() (line 871), the pixel data block parsing
+loop at line 916 checks `buf < buf_end` only at the top of the while loop.
+After consuming 1 byte for the switch selector (`*buf++` at line 922), the
+map-table-update cases read additional bytes from `buf` WITHOUT verifying
+that sufficient data remains before `buf_end`:
+
+  Case 0x20 (line 961-965): Reads 2 bytes unconditionally
+  Case 0x21 (line 967-969): Reads 4 bytes unconditionally
+  Case 0x22 (line 971-973): Reads 16 bytes unconditionally
+
+Vulnerable code (lines 961-973):
+
+        case 0x20:
+            map2to4[0] = (*buf) >> 4;
+            map2to4[1] = (*buf++) & 0xf;
+            map2to4[2] = (*buf) >> 4;
+            map2to4[3] = (*buf++) & 0xf;
+            break;
+        case 0x21:
+            for (i = 0; i < 4; i++)
+                map2to8[i] = *buf++;
+            break;
+        case 0x22:
+            for (i = 0; i < 16; i++)
+                map4to8[i] = *buf++;
+            break;
+
+The while loop guard at line 916 only guarantees 1 byte is available (for the
+switch byte). If an attacker provides a pixel data block ending with 0x22
+followed by fewer than 16 bytes (or 0x21 with fewer than 4, or 0x20 with
+fewer than 2), the reads will go past buf_end into adjacent heap memory.
+
+For case 0x22 this can read up to 15 bytes beyond the allocated buffer.
+
+================================================================================
+IMPACT
+================================================================================
+
+1. Information Disclosure: The over-read data is written into stack-local
+   map_table arrays (map2to4, map2to8, map4to8). These tables are subsequently
+   used to transform pixel values written into region->pbuf via the
+   dvbsub_read_*bit_string() functions. The leaked heap bytes thus become
+   visible in the decoded subtitle bitmap output, allowing an attacker to
+   exfiltrate heap memory contents through crafted subtitle streams.
+
+2. Denial of Service: Reading past buffer boundaries can cause a segfault
+   if the over-read crosses a page boundary into unmapped memory.
+
+3. Attack vector: The vulnerability is triggered by processing a maliciously
+   crafted DVB subtitle stream. This can be exploited remotely by embedding
+   a crafted subtitle track in a media file (e.g., .ts, .mkv) that is opened
+   by any application using FFmpeg's DVB subtitle decoder (e.g., ffmpeg,
+   ffplay, VLC, mpv, Kodi, etc.).
+
+================================================================================
+ROOT CAUSE
+================================================================================
+
+The map table update cases (0x20, 0x21, 0x22) within dvbsub_parse_pixel_data_block()
+do not validate that `buf + N <= buf_end` before reading N bytes. The outer while
+loop only ensures 1 byte is available for the switch discriminant, not for the
+variable-length payload of each case.
+
+================================================================================
+FIX
+================================================================================
+
+Add bounds checks before each map table read:
+
+        case 0x20:
++           if (buf_end - buf < 2) {
++               av_log(avctx, AV_LOG_ERROR, "insufficient data for 2-to-4 map\n");
++               return;
++           }
+            map2to4[0] = (*buf) >> 4;
+            ...
+        case 0x21:
++           if (buf_end - buf < 4) {
++               av_log(avctx, AV_LOG_ERROR, "insufficient data for 2-to-8 map\n");
++               return;
++           }
+            for (i = 0; i < 4; i++)
+                map2to8[i] = *buf++;
+            break;
+        case 0x22:
++           if (buf_end - buf < 16) {
++               av_log(avctx, AV_LOG_ERROR, "insufficient data for 4-to-8 map\n");
++               return;
++           }
+            for (i = 0; i < 16; i++)
+                map4to8[i] = *buf++;
+            break;

@@ -1,0 +1,94 @@
+Vulnerability: Out-of-Bounds Read and Memory Exhaustion via Unchecked APE Tag Field Sizes
+File: libavformat/apetag.c
+Severity: HIGH (CVSS ~7.5)
+Type: CWE-125 (Out-of-bounds Read), CWE-770 (Allocation of Resources Without Limits)
+
+== Summary ==
+
+In ff_ape_parse_tag() and ape_tag_read_field(), individual APE tag field
+sizes are not validated against the total tag data size (tag_bytes). An
+attacker can craft a malicious media file with an APE tag where individual
+field "size" values vastly exceed the actual tag data region, causing:
+
+1. Out-of-bounds read beyond the APE tag boundary in the file
+2. Massive heap allocations (up to ~2GB per field, 65536 fields max)
+3. Stream creation with attacker-controlled codec parameters from
+   out-of-bounds data, enabling codec confusion attacks
+
+== Root Cause ==
+
+In ape_tag_read_field() (line 46), the field size is read from the stream:
+
+    size = avio_rl32(pb);  /* field size */
+
+This size is only checked against a per-field maximum (line 60):
+
+    if (size > INT32_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
+
+But it is NEVER validated against the remaining bytes within the APE tag
+(tag_bytes - APE_TAG_FOOTER_BYTES). The tag data region can be as small as
+0 bytes (tag_bytes = 32, all footer), yet a single field can claim a size
+of up to 2,147,483,583 bytes (~2GB).
+
+In ff_ape_parse_tag(), the field count (up to 65536) is also not validated
+against tag_bytes. The loop on line 166-167:
+
+    for (i=0; i<fields; i++)
+        if (ape_tag_read_field(s) < 0) break;
+
+...will happily read fields beyond the tag boundary.
+
+== Attack Scenario ==
+
+1. Attacker crafts a media file (e.g., APE, MPC, WavPack, TTA, AAC) with
+   a valid APE tag footer.
+
+2. tag_bytes is set to a small value (e.g., 64 = 32 bytes items + 32 footer).
+
+3. fields count is set high (e.g., 100).
+
+4. Within the 32-byte items section, the attacker places a field entry with
+   flags = APE_TAG_FLAG_IS_BINARY and a crafted filename ending in ".jpg"
+   (to match ff_guess_image2_codec), with a huge size value.
+
+5. The parser:
+   a) Allocates a massive heap buffer via av_malloc(size+1)
+   b) Reads file data far beyond the tag boundary via avio_read()
+   c) Creates an AVStream with attacker-chosen codec_id
+   d) Calls ff_add_attached_pic() or ff_get_extradata() with the
+      out-of-bounds data, feeding it to downstream decoders
+
+6. This enables:
+   - Denial of Service through memory exhaustion (process crash / OOM kill)
+   - Information disclosure: file data outside the tag leaks into metadata
+   - Codec confusion: attacker forces a specific decoder to process
+     attacker-controlled data, potentially triggering decoder-specific bugs
+
+== Secondary Issue: AVStream Leak on Binary Tag Skip ==
+
+In ape_tag_read_field() lines 68-78, when a binary tag has size <= ret
+(insufficient data for the binary content), the function returns 0 (success)
+but the AVStream allocated on line 68 via avformat_new_stream() is never
+cleaned up. Repeated triggering leaks streams and associated memory.
+
+== Affected Code Path ==
+
+libavformat/apetag.c:
+  - ape_tag_read_field()  lines 39-108
+  - ff_ape_parse_tag()    lines 110-170
+
+Called from: ape.c, mpc.c, mpc8.c, wvdec.c, tta.c, takdec.c, rka.c, aacdec.c
+
+== Fix ==
+
+Add cumulative field size tracking in ff_ape_parse_tag() and pass the
+remaining tag bytes to ape_tag_read_field(), rejecting fields whose size
+exceeds the remaining tag data:
+
+    int64_t remaining = tag_bytes - APE_TAG_FOOTER_BYTES;
+    for (i = 0; i < fields; i++) {
+        int consumed = ape_tag_read_field(s, remaining);
+        if (consumed < 0) break;
+        remaining -= consumed;
+        if (remaining < 0) break;
+    }

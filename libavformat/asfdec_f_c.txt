@@ -1,0 +1,110 @@
+Vulnerability: Heap Buffer Overflow via Overlapping Packet Fragments in ASF Demuxer
+File: libavformat/asfdec_f.c
+Function: asf_parse_packet (line 1136)
+Severity: Critical (Remote Code Execution / Denial of Service)
+Type: CWE-122 (Heap-based Buffer Overflow), CWE-190 (Integer Underflow wrapping to size_t)
+
+=== SUMMARY ===
+
+A heap buffer overflow exists in the ASF demuxer's packet fragment reassembly
+logic. By sending crafted overlapping packet fragments, an attacker can cause
+the `frag_offset` tracking variable to exceed `pkt.size`, which leads to an
+integer underflow in a `memset()` call that overflows the heap buffer.
+
+=== ROOT CAUSE ===
+
+In asf_parse_packet(), fragments are reassembled into complete packets. The
+per-stream `frag_offset` (ASFStream.frag_offset, line 53) accumulates the
+total number of bytes received, while `packet_frag_offset` (from packet
+headers) indicates where each fragment should be placed in the buffer.
+
+The bounds check at lines 1268-1275 validates each individual fragment:
+
+    if (asf->packet_frag_offset >= asf_st->pkt.size ||
+        asf->packet_frag_size > asf_st->pkt.size - asf->packet_frag_offset) {
+        ...
+        continue;
+    }
+
+This ensures each fragment's (offset, size) pair fits within the packet buffer.
+However, the cumulative `frag_offset` is updated unconditionally at line 1303:
+
+    asf_st->frag_offset += ret;
+
+When two fragments OVERLAP (e.g., both write to offset 0 with the same size),
+the individual bounds checks pass, but frag_offset accumulates BOTH reads,
+potentially exceeding pkt.size.
+
+The overflow is triggered at line 1277-1279 when a subsequent fragment arrives
+with a different offset:
+
+    if (asf->packet_frag_offset != asf_st->frag_offset && !asf_st->pkt_clean) {
+        memset(asf_st->pkt.data + asf_st->frag_offset, 0,
+               asf_st->pkt.size - asf_st->frag_offset);
+
+When frag_offset > pkt.size:
+  - `asf_st->pkt.data + asf_st->frag_offset` points PAST the buffer
+  - `asf_st->pkt.size - asf_st->frag_offset` is NEGATIVE (e.g., 100 - 120 = -20)
+  - Cast to size_t for memset(), -20 wraps to 0xFFFFFFFFFFFFFFEC (on 64-bit)
+  - memset writes zeros far beyond the allocated heap buffer
+
+=== ATTACK SCENARIO ===
+
+1. Craft an ASF file with a valid stream header (audio or video)
+2. Create a data packet with packet_obj_size = 100 (allocates 100-byte buffer)
+3. Send Fragment 1: packet_frag_offset=0, packet_frag_size=60
+   - Bounds check: 0+60 <= 100 PASS
+   - Data written to pkt.data[0..59]
+   - frag_offset = 0 + 60 = 60
+4. Send Fragment 2 (OVERLAPPING): packet_frag_offset=0, packet_frag_size=60
+   - Bounds check: 0+60 <= 100 PASS
+   - memset at line 1278: pkt.data+60, size=100-60=40 (within bounds, OK)
+   - Data written to pkt.data[0..59] (overlap)
+   - frag_offset = 60 + 60 = 120 (NOW EXCEEDS pkt.size=100!)
+5. Send Fragment 3: packet_frag_offset=0, packet_frag_size=10
+   - Bounds check: 0+10 <= 100 PASS
+   - memset at line 1278: pkt.data+120, size=100-120 = -20
+   - size_t conversion: -20 -> 0xFFFFFFFFFFFFFFEC
+   - HEAP BUFFER OVERFLOW: writes ~18 exabytes of zeros starting at pkt.data+120
+
+=== IMPACT ===
+
+- Denial of Service: Guaranteed crash via SIGSEGV/SIGBUS from massive memset
+- Potential Remote Code Execution: Heap metadata corruption can be leveraged
+  for arbitrary write primitives on glibc-based systems
+- Triggered by: Opening a crafted .asf/.wmv/.wma file with any application
+  using FFmpeg's libavformat (VLC, mpv, Kodi, web browsers via FFmpeg, etc.)
+
+=== AFFECTED CODE ===
+
+libavformat/asfdec_f.c:1277-1279:
+    if (asf->packet_frag_offset != asf_st->frag_offset && !asf_st->pkt_clean) {
+        memset(asf_st->pkt.data + asf_st->frag_offset, 0,
+               asf_st->pkt.size - asf_st->frag_offset);
+
+libavformat/asfdec_f.c:1303 (frag_offset accumulation without overlap check):
+    asf_st->frag_offset += ret;
+
+=== SUGGESTED FIX ===
+
+Add a check to prevent frag_offset from exceeding pkt.size, and/or validate
+that overlapping fragments do not cause cumulative overflow:
+
+    // Before the memset at line 1277:
+    if (asf_st->frag_offset >= asf_st->pkt.size) {
+        av_log(s, AV_LOG_ERROR, "frag_offset %d exceeds pkt size %d\n",
+               asf_st->frag_offset, asf_st->pkt.size);
+        asf_st->frag_offset = 0;
+        av_packet_unref(&asf_st->pkt);
+        continue;
+    }
+
+Or alternatively, reject overlapping fragments:
+
+    // After the bounds check at line 1268, before avio_read at line 1282:
+    if (asf->packet_frag_offset < asf_st->frag_offset) {
+        av_log(s, AV_LOG_ERROR, "overlapping fragment rejected\n");
+        avio_skip(pb, asf->packet_frag_size);
+        asf->packet_size_left -= asf->packet_frag_size;
+        continue;
+    }

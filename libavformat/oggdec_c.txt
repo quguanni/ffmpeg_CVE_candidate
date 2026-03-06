@@ -1,0 +1,69 @@
+Vulnerability: Heap Buffer Overflow via Integer Underflow in ogg_save() Triggered by Unchecked ogg_restore() Failure in ogg_get_length()
+
+Severity: High (Heap corruption / potential code execution)
+
+Location: libavformat/oggdec.c, lines 88, 695
+
+Root Cause:
+In ogg_get_length() (line 695), the return value of ogg_restore(s) is not checked.
+If ogg_restore() fails internally at the av_reallocp_array() call (line 149-152),
+it sets ogg->nstreams = 0 and ogg->streams = NULL, then returns an error code.
+Since ogg_get_length() ignores this error, execution continues to ogg_save() at
+line 697 with ogg->nstreams == 0.
+
+In ogg_save() (line 88), the allocation size is computed as:
+    av_malloc(sizeof(*ost) + (ogg->nstreams - 1) * sizeof(*ogg->streams))
+
+When ogg->nstreams == 0:
+  - (ogg->nstreams - 1) evaluates to -1 as a signed int
+  - This is then implicitly converted to size_t for the multiplication with
+    sizeof(*ogg->streams) (~456 bytes on 64-bit)
+  - (size_t)(-1) == SIZE_MAX == 0xFFFFFFFFFFFFFFFF on 64-bit
+  - SIZE_MAX * sizeof(ogg_stream) wraps modulo 2^64 to approximately:
+    2^64 - sizeof(ogg_stream)
+  - Adding sizeof(ogg_state) wraps again to a very small value
+    (roughly sizeof(ogg_state) - sizeof(ogg_stream), i.e. ~32 bytes)
+
+This results in av_malloc() allocating a tiny heap buffer (~32 bytes).
+The subsequent writes to the ogg_state struct fields:
+    ost->pos      = avio_tell(s->pb);    // offset 0, 8 bytes
+    ost->curidx   = ogg->curidx;         // offset 8, 4 bytes
+    ost->next     = ogg->state;           // offset 16, 8 bytes
+    ost->nstreams = ogg->nstreams;        // offset 24, 4 bytes
+
+These writes reach the boundary of the allocation. On 32-bit systems, the
+calculation produces an even smaller allocation (~20 bytes), and the writes
+to ost->next and ost->nstreams overflow the heap buffer, corrupting adjacent
+heap metadata or objects.
+
+Additionally, the memcpy at line 99:
+    memcpy(ost->streams, ogg->streams, ogg->nstreams * sizeof(*ogg->streams))
+passes a NULL source pointer (ogg->streams == NULL) with size 0. While the
+size-0 memcpy typically doesn't crash, passing NULL is undefined behavior
+per the C standard.
+
+Furthermore, when ogg_restore() fails at line 695, the ogg_state allocated
+by the first ogg_save() at line 673 is leaked (av_free(ost) at line 157 is
+never reached on the error path), constituting a memory leak.
+
+Trigger Condition:
+A crafted OGG file that causes memory pressure during the ogg_get_length()
+duration-probing phase can trigger the av_reallocp_array() failure in
+ogg_restore(). This is feasible when:
+  - The file is seekable (required for ogg_get_length to execute)
+  - The file contains valid OGG headers to pass ogg_read_header()
+  - The file's end-of-stream pages cause large buffer allocations during
+    the page-reading loop (lines 679-693), exhausting available memory
+  - The subsequent ogg_restore() av_reallocp_array() then fails
+
+Impact:
+  - Heap buffer overflow (write primitive on 32-bit systems)
+  - Use of NULL ogg->streams pointer in subsequent operations
+  - Memory leak of saved ogg_state
+  - Potential for arbitrary code execution via heap corruption
+
+Fix:
+Check the return value of ogg_restore() at line 695:
+    ret = ogg_restore(s);
+    if (ret < 0)
+        return ret;

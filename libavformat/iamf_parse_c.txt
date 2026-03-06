@@ -1,0 +1,91 @@
+VULNERABILITY: Inverted Subblock Duration Validation in IAMF Parameter Parsing
+File: libavformat/iamf_parse.c (and libavformat/iamf_reader.c)
+Function: param_parse() (line 671), and iamf_reader.c (line 204)
+Severity: High (CWE-190: Integer Overflow, CWE-1025: Comparison Logic Error)
+
+== Summary ==
+
+The subblock duration validation check in param_parse() at line 671 has an
+inverted comparison operator. The condition:
+
+    if (duration - total_duration > subblock_duration)
+
+should be:
+
+    if (subblock_duration > duration - total_duration)
+
+The intended check is to reject subblocks whose duration EXCEEDS the remaining
+duration (i.e., subblock_duration > remaining). Instead, the current code
+rejects subblocks whose duration is LESS than the remaining duration, which is
+the normal/valid case for all non-final subblocks.
+
+The identical bug exists in libavformat/iamf_reader.c at line 204.
+
+== Detailed Analysis ==
+
+In param_parse(), when mode == 0 and constant_subblock_duration == 0, variable-
+length subblock durations are read from the input stream. The code at line 671
+is supposed to validate that each subblock_duration does not exceed what remains
+of the total duration:
+
+    Line 617: unsigned int duration = 0, ...;
+    Line 618: unsigned int total_duration = 0;
+    ...
+    Line 669: if (constant_subblock_duration == 0) {
+    Line 670:     subblock_duration = ffio_read_leb(pb);
+    Line 671:     if (duration - total_duration > subblock_duration) {  // BUG: inverted
+    Line 672:         ...return AVERROR_INVALIDDATA;
+    Line 676:     total_duration += subblock_duration;
+
+The inverted comparison causes:
+1. VALID inputs rejected: When subblock_duration < remaining (normal for any
+   non-final subblock in a multi-subblock parameter), the check evaluates to
+   TRUE and incorrectly returns an error.
+2. INVALID inputs accepted: When subblock_duration > remaining (attacker-
+   controlled excessive duration), the check evaluates to FALSE and incorrectly
+   allows the value through.
+
+== Exploitation ==
+
+An attacker can craft an IAMF media file with a parameter definition containing:
+- mode = 0 (explicit duration mode)
+- constant_subblock_duration = 0 (variable subblock durations)
+- nb_subblocks >= 2
+- subblock_duration values that individually exceed the remaining duration
+
+Because the check is inverted, these excessive values pass validation. The
+unsigned int total_duration accumulates without bound via:
+
+    total_duration += subblock_duration;  // line 676
+
+Since total_duration is "unsigned int" (32-bit), the attacker can craft subblock
+duration values whose sum wraps around modulo 2^32 to exactly equal the declared
+duration, thus also bypassing the final consistency check at line 706:
+
+    if (!mode && !constant_subblock_duration && total_duration != duration)
+
+This results in a semantically valid AVIAMFParamDefinition containing subblock
+durations with attacker-controlled large values (up to UINT_MAX). These bogus
+subblock_duration values are stored in AVIAMFMixGain, AVIAMFDemixingInfo, or
+AVIAMFReconGain structures and used downstream in audio processing, potentially
+causing integer overflows in timing/buffer calculations, or incorrect audio
+rendering behavior.
+
+The same vulnerability in iamf_reader.c (line 204) is triggered at runtime when
+processing IAMF parameter blocks during media playback, making it exploitable
+via any IAMF-containing media file (standalone .iamf or embedded in .mp4/.mkv).
+
+== Attack Vector ==
+
+A crafted IAMF media file opened with any FFmpeg-based application (ffplay,
+ffmpeg, ffprobe, or any application using libavformat) triggers the vulnerable
+code path during descriptor parsing (iamf_parse.c) and/or during runtime
+parameter block processing (iamf_reader.c).
+
+== Fix ==
+
+Swap the comparison operands at line 671 of iamf_parse.c and line 204 of
+iamf_reader.c:
+
+  - if (duration - total_duration > subblock_duration) {
+  + if (subblock_duration > duration - total_duration) {

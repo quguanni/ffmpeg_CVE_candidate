@@ -1,0 +1,87 @@
+VULNERABILITY: Heap Buffer Over-Read via UNCHECKED_BITSTREAM_READER in H.263 Decoder
+
+File: libavcodec/ituh263dec.c
+Severity: HIGH (CVSS ~7.5)
+Type: CWE-125 (Out-of-bounds Read) / Heap Buffer Over-Read
+
+SUMMARY:
+The H.263 bitstream decoder (ituh263dec.c) explicitly disables bitstream bounds
+checking via `#define UNCHECKED_BITSTREAM_READER 1` at line 30. This causes all
+bitstream reading macros (get_bits, show_bits, skip_bits, SHOW_UBITS, etc.) to
+omit validation that sufficient data remains in the buffer before reading. When
+processing a crafted/truncated H.263 bitstream, the decoder reads past the end
+of the allocated bitstream buffer on the heap, causing a heap buffer over-read.
+
+ROOT CAUSE:
+Line 30: #define UNCHECKED_BITSTREAM_READER 1
+
+This preprocessor define is consumed by libavcodec/get_bits.h and disables the
+bounds-checking codepath in the bitstream reader macros. Every subsequent call
+to get_bits(), show_bits(), skip_bits(), GET_RL_VLC(), SHOW_UBITS(), etc.
+throughout the entire file becomes unchecked.
+
+VULNERABLE CODE PATHS:
+
+1. h263_decode_block() (lines 529-675):
+   The main coefficient decoding loop (lines 594-667) uses OPEN_READER/
+   UPDATE_CACHE/GET_RL_VLC/SHOW_UBITS/SHOW_SBITS macros in a for(;;) loop.
+   The escape code path (lines 604-637) reads 7+8 bits minimum, potentially
+   12 or 11 more bits, all without any remaining-bits check. A truncated
+   bitstream causes reads past the heap buffer boundary.
+
+   Specific escape code path (lines 619-636):
+     run = SHOW_UBITS(re, &h->gb, 7) + 1;     // 7 bits, unchecked
+     level = (int8_t)SHOW_UBITS(re, &h->gb, 8); // 8 bits, unchecked
+     if(level == -128){
+         UPDATE_CACHE(re, &h->gb);
+         level = SHOW_UBITS(re, &h->gb, 5);    // 5 more bits, unchecked
+         level |= SHOW_SBITS(re, &h->gb, 6)... // 6 more bits, unchecked
+     }
+
+2. h263p_decode_umotion() (lines 317-342):
+   Contains a while(get_bits1()) loop that reads bits one at a time until
+   a 0-bit is encountered or code >= 32768. With unchecked reads and a
+   truncated bitstream, this loop reads far past the buffer. The only
+   safety check (code >= 32768) requires ~15 iterations of over-reads
+   before triggering.
+
+3. preview_obmc() (lines 347-434):
+   Speculatively parses the next macroblock's data (motion vectors, VLC
+   codes) without any bounds checking. With UNCHECKED_BITSTREAM_READER,
+   all reads in this speculative parse can overflow the buffer.
+
+4. ff_h263_decode_mb() (lines 784-1089):
+   The main macroblock decoding function reads VLC codes, motion vectors,
+   and block data. The only get_bits_left() check is at line 1073, AFTER
+   all the unchecked reads have already occurred — the over-read damage
+   is done before this check executes.
+
+IMPACT:
+- Information Disclosure: Reading past the bitstream buffer exposes adjacent
+  heap memory contents. The read data influences decoded coefficient values
+  and motion vectors, which are written to the output frame. An attacker can
+  craft inputs to extract heap contents through the decoded video output.
+- Denial of Service: Reading unmapped memory pages causes a segfault/crash.
+- Potential for further exploitation depending on heap layout.
+
+TRIGGER CONDITIONS:
+- A crafted H.263 bitstream with a valid picture start code (0x000020) and
+  valid enough header fields to enter macroblock decoding, but with
+  truncated/insufficient data for the block coefficient decoding phase.
+- No special codec flags or configurations required; this is the default
+  code path for all H.263 decoding.
+
+AFFECTED FUNCTIONS:
+- h263_decode_block()
+- h263p_decode_umotion()
+- preview_obmc()
+- ff_h263_decode_mb()
+- h263_decode_gob_header()
+- ff_h263_resync()
+
+FIX RECOMMENDATION:
+Remove or change `#define UNCHECKED_BITSTREAM_READER 1` to
+`#define UNCHECKED_BITSTREAM_READER 0` (line 30), and add appropriate
+get_bits_left() checks in the hot loops, particularly in h263_decode_block()
+before escape code parsing, and in h263p_decode_umotion() within the while
+loop.

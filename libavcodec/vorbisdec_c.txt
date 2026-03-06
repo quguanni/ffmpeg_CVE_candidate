@@ -1,0 +1,124 @@
+VULNERABILITY: Heap Buffer Over-Read/Write via Missing Validation of Residue begin/end Against Blocksize and Unvalidated Mapping mux[] Indices
+
+FILE: libavcodec/vorbisdec.c
+
+SEVERITY: High (Heap OOB read/write, potential code execution)
+
+DESCRIPTION:
+Multiple interacting vulnerabilities in the Vorbis I decoder allow a crafted
+Vorbis bitstream to trigger heap-based buffer over-read and over-write
+conditions.
+
+=== PRIMARY: Missing bounds check on residue begin/end during setup ===
+
+In vorbis_parse_setup_hdr_residues() (line 720-731), the residue begin and
+end fields are read as 24-bit values from the bitstream (max 16,777,215)
+but are NEVER validated against vc->blocksize[1]/2 (the actual audio buffer
+size, max 4096). The only validation is:
+
+  res_setup->begin = get_bits(gb, 24);
+  res_setup->end   = get_bits(gb, 24);
+  res_setup->partition_size = get_bits(gb, 24) + 1;
+  if (res_setup->begin > res_setup->end ||
+      (res_setup->end - res_setup->begin) / res_setup->partition_size
+      > FFMIN(V_MAX_PARTITIONS, 65535)) { ... error ... }
+
+This allows vr->end to be set to values much larger than blocksize[1]/2.
+
+The runtime check in vorbis_residue_decode_internal() at line 1436:
+
+  if (max_output > ch_left * vlen) {
+      if (max_output <= ch_left * vlen + vr->partition_size*ch_used/ch) {
+          ptns_to_read--;
+          libvorbis_bug = 1;
+      } else {
+          return AVERROR_INVALIDDATA;
+      }
+  }
+
+The "libvorbis_bug" compatibility workaround intentionally RELAXES the bounds
+check by allowing max_output to exceed the buffer boundary by up to
+partition_size*ch_used/ch bytes. While ptns_to_read is decremented to
+compensate, the tolerance window creates a fragile boundary condition:
+
+For residue type 2 with ch=2, dim=4 (lines 1514-1524), writes go to:
+  vec[voffs]             += codebook.codevectors[coffs];
+  vec[voffs + 1]         += codebook.codevectors[coffs + 2];
+  vec[voffs + vlen]      += codebook.codevectors[coffs + 1];
+  vec[voffs + vlen + 1]  += codebook.codevectors[coffs + 3];
+
+Where voffs advances by 2 per iteration. With a crafted partition_size and
+end value, the voffs + vlen + 1 access can reach exactly the buffer boundary,
+and the relaxed libvorbis_bug check allows configurations that push writes
+to the edge of or past the allocated channel_residues buffer.
+
+=== SECONDARY: Missing validation of mux[] against submaps ===
+
+In vorbis_parse_setup_hdr_mappings() (line 841-842):
+
+  for (j = 0; j < vc->audio_channels; ++j)
+      mapping_setup->mux[j] = get_bits(gb, 4);
+
+The mux[j] values (4-bit, range 0-15) are NEVER validated against
+mapping_setup->submaps. When submaps > 1 and mux[j] >= submaps,
+the channel is "orphaned" from residue decoding, causing:
+
+1. At line 1661: mapping->submap_floor[mapping->mux[i]] accesses
+   uninitialized (zero-filled) submap_floor entries beyond submaps,
+   causing the wrong floor to be used for the channel.
+
+2. The channel's res_chan[j] entry may never be assigned (lines 1691-1701),
+   leaving it as uninitialized stack memory. While the ch_left > 0 check
+   at line 1718 provides a safety net, the floor decode at line 1661
+   executes BEFORE this check, processing all channels with potentially
+   invalid floor/residue mappings.
+
+=== TERTIARY: Fail-open error handling in floor0 decode ===
+
+In vorbis_floor0_decode() (line 1136-1138):
+
+  if (book_idx >= vf->num_books) {
+      av_log(vc->avctx, AV_LOG_ERROR, "floor0 dec: booknumber too high!\n");
+      book_idx = 0;  // FAIL-OPEN: continues with wrong codebook
+  }
+
+Instead of returning AVERROR_INVALIDDATA, the decoder silently falls through
+using codebook index 0. This allows processing to continue with an incorrect
+codebook, which may have different dimensions than expected, causing
+miscalculation of LSP coefficients and incorrect floor synthesis that
+propagates through the entire decode pipeline.
+
+IMPACT:
+- Heap buffer over-read: Information disclosure via reading beyond
+  channel_residues buffer boundaries
+- Heap buffer over-write: Potential arbitrary code execution via writing
+  beyond channel_residues buffer with attacker-controlled codevector values
+- Denial of service: Crash or incorrect output from fail-open error handling
+
+ROOT CAUSE:
+- Missing setup-time validation of residue begin/end against blocksize
+- Missing validation of mapping mux values against submaps count
+- Fail-open error handling pattern in floor0 decode
+
+AFFECTED VERSIONS:
+All FFmpeg versions containing libavcodec/vorbisdec.c with the
+libvorbis_bug compatibility workaround.
+
+SUGGESTED FIX:
+1. Add validation in vorbis_parse_setup_hdr_residues():
+   if (res_setup->end > vc->blocksize[1] / 2) {
+       return AVERROR_INVALIDDATA;
+   }
+
+2. Add validation in vorbis_parse_setup_hdr_mappings():
+   for (j = 0; j < vc->audio_channels; ++j) {
+       mapping_setup->mux[j] = get_bits(gb, 4);
+       if (mapping_setup->mux[j] >= mapping_setup->submaps) {
+           return AVERROR_INVALIDDATA;
+       }
+   }
+
+3. Fix fail-open in vorbis_floor0_decode():
+   if (book_idx >= vf->num_books) {
+       return AVERROR_INVALIDDATA;
+   }

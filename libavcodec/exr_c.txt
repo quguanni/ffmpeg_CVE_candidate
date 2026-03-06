@@ -1,0 +1,89 @@
+Vulnerability: Unchecked Return Value in rle_uncompress() Leading to Use of Uninitialized Heap Memory
+
+File: libavcodec/exr.c
+Function: rle_uncompress() (line 267-278)
+Type: CWE-252 (Unchecked Return Value) -> CWE-908 (Use of Uninitialized Resource)
+Severity: High (Heap information disclosure / potential further exploitation)
+
+== Description ==
+
+The function rle_uncompress() calls rle() at line 270 but ignores its return value.
+The rle() function (lines 225-265) returns AVERROR_INVALIDDATA when the RLE-compressed
+data is malformed (e.g., run lengths overflow the destination buffer, or the decompressed
+size doesn't match the expected size). However, rle_uncompress() unconditionally proceeds
+to call predictor() and reorder_pixels() on the td->tmp buffer, then returns 0 (success).
+
+Vulnerable code (lines 267-278):
+
+    static int rle_uncompress(const EXRContext *ctx, const uint8_t *src, int compressed_size,
+                              int uncompressed_size, EXRThreadData *td)
+    {
+        rle(td->tmp, src, compressed_size, uncompressed_size);  // RETURN VALUE IGNORED
+
+        av_assert1(uncompressed_size % 2 == 0);
+
+        ctx->dsp.predictor(td->tmp, uncompressed_size);
+        ctx->dsp.reorder_pixels(td->uncompressed_data, td->tmp, uncompressed_size);
+
+        return 0;
+    }
+
+Compare with the correct handling in dwa_uncompress() (lines 1131-1133):
+
+    ret = rle(td->rle_raw_data, td->rle_data, rle_usize, rle_raw_size);
+    if (ret < 0)
+        return ret;
+
+== Impact ==
+
+When a crafted EXR file with RLE compression (compression type 1) contains malformed
+RLE data, the rle() function will fail partway through decompression. The td->tmp buffer
+will be only partially filled with decompressed data. The remainder of the buffer contains:
+
+1. On first decode: zero-initialized memory (from av_fast_padded_malloc's initial
+   av_mallocz), so the impact is incorrect pixel output.
+
+2. On subsequent decodes (e.g., video streams or multi-frame processing): STALE HEAP
+   DATA from previous decompression operations. The td->tmp buffer is reused across
+   frames via av_fast_padded_malloc, which does not zero the buffer on reuse when the
+   existing allocation is large enough.
+
+The uninitialized/stale data is then:
+  - Processed by predictor() which applies a delta-decoding filter across the buffer
+  - Reordered by reorder_pixels() into td->uncompressed_data
+  - Ultimately written into the output AVFrame pixel data in decode_block()
+
+This enables:
+  - Heap information disclosure: stale heap contents from previous operations are
+    exposed as pixel data in the decoded image output
+  - In a multi-frame decoding scenario (e.g., EXR sequences), data from one frame
+    can leak into another frame's output
+  - The corrupted data processed by predictor()/reorder_pixels() could potentially
+    be leveraged for further exploitation depending on the application
+
+== Trigger Path ==
+
+1. Attacker crafts an EXR file with compression = EXR_RLE (value 1)
+2. The RLE-compressed data is intentionally malformed so rle() returns error
+3. rle_uncompress() ignores the error and processes partially-filled td->tmp
+4. decode_block() uses the result as valid decompressed pixel data
+5. The output frame contains uninitialized/stale heap memory contents
+
+== Fix ==
+
+Check the return value of rle() and propagate the error:
+
+    static int rle_uncompress(const EXRContext *ctx, const uint8_t *src, int compressed_size,
+                              int uncompressed_size, EXRThreadData *td)
+    {
+        int ret = rle(td->tmp, src, compressed_size, uncompressed_size);
+        if (ret < 0)
+            return ret;
+
+        av_assert1(uncompressed_size % 2 == 0);
+
+        ctx->dsp.predictor(td->tmp, uncompressed_size);
+        ctx->dsp.reorder_pixels(td->uncompressed_data, td->tmp, uncompressed_size);
+
+        return 0;
+    }

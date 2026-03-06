@@ -1,0 +1,82 @@
+CVE Candidate: Heap Buffer Over-Read via Unchecked Error Return in msmpeg4v2_decode_motion()
+
+File: libavcodec/msmpeg4dec.c
+Severity: HIGH (Heap-buffer-over-read, potential information disclosure / crash)
+Affected codecs: MSMPEG4v1, MSMPEG4v2 (msmpeg4v1, msmpeg4v2 decoders)
+
+=== Vulnerability Description ===
+
+In msmpeg4v2_decode_motion() (line 77-107), when the H.263 motion vector VLC
+decode fails (get_vlc2 returns a negative value), the function returns the
+sentinel value 0xffff (65535) instead of propagating the error:
+
+    static int msmpeg4v2_decode_motion(H263DecContext *const h, int pred, int f_code)
+    {
+        int code, val, sign, shift;
+        code = get_vlc2(&h->gb, ff_h263_mv_vlc, H263_MV_VLC_BITS, 2);
+        if (code < 0)
+            return 0xffff;   // <-- returns 65535 as a "motion vector" value
+        ...
+    }
+
+The caller in msmpeg4v12_decode_mb() (lines 172-179) does NOT check for this
+error sentinel. It stores the value directly as a motion vector:
+
+    ff_h263_pred_motion(&h->c, 0, 0, &mx, &my);
+    mx = msmpeg4v2_decode_motion(h, mx, 1);  // mx = 65535 on error
+    my = msmpeg4v2_decode_motion(h, my, 1);  // my = 65535 on error
+
+    h->c.mv_dir  = MV_DIR_FORWARD;
+    h->c.mv_type = MV_TYPE_16X16;
+    h->c.mv[0][0][0] = mx;   // stores 65535
+    h->c.mv[0][0][1] = my;   // stores 65535
+    *mb_type_ptr = MB_TYPE_FORWARD_MV | MB_TYPE_16x16;
+
+The function then returns 0 (success). During subsequent motion compensation,
+the motion vector value of 65535 is used to compute source addresses in the
+reference frame buffer (e.g., src + my * linesize + mx). This results in a
+massive out-of-bounds read far beyond the allocated reference frame, as valid
+motion vectors are normally in the range [-63, 63].
+
+=== Impact ===
+
+- Heap buffer over-read during motion compensation: the decoder reads pixels
+  from memory far beyond the reference frame buffer boundaries.
+- Crash (segfault) on most systems when the computed address is unmapped.
+- Potential information disclosure if the out-of-bounds memory is mapped and
+  the decoded frame data is observable by an attacker (e.g., rendered to screen
+  or written to an output file).
+
+=== Root Cause ===
+
+The function uses a sentinel return value (0xffff) instead of a proper error
+code that the caller can distinguish from valid motion vector values. The caller
+does not check for this sentinel. The correct fix would be either:
+1. Return a negative error code and check it in the caller, OR
+2. Check for the 0xffff sentinel in msmpeg4v12_decode_mb() and return -1.
+
+=== Trigger Conditions ===
+
+- Input is a crafted MSMPEG4v1 or MSMPEG4v2 bitstream (AVI container typical).
+- A P-frame is present with a non-intra macroblock.
+- The motion vector VLC codeword is malformed/truncated, causing get_vlc2 to
+  fail and return a negative value.
+- The decoder continues with the corrupted motion vector and attempts motion
+  compensation.
+
+=== Additional Issue (same file) ===
+
+In ff_msmpeg4_decode_block() (lines 627-633), when msmpeg4_decode_dc() returns
+-1 (DC VLC decode error), the error is not propagated. The function logs the
+error but continues decoding AC coefficients from a corrupted bitstream
+position when inter_intra_pred is false. This can lead to unpredictable
+behavior including further out-of-bounds reads from VLC tables.
+
+    level = msmpeg4_decode_dc(ms, n, &dc_pred_dir);
+    if (level < 0){
+        av_log(h->c.avctx, AV_LOG_ERROR, "dc overflow- ...");
+        if (h->c.inter_intra_pred)
+            level = 0;
+        // BUG: no "return -1" when inter_intra_pred is false
+        // level remains -1, decoding continues with corrupt bitstream state
+    }

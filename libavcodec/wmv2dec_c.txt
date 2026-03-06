@@ -1,0 +1,124 @@
+Vulnerability: Heap Buffer Over-Read in parse_mb_skip() — Missing Bitstream Bounds Checks
+File: libavcodec/wmv2dec.c
+Function: parse_mb_skip() (lines 315-377)
+Type: CWE-125 (Out-of-bounds Read)
+Severity: High (Heap information disclosure / crash via crafted WMV2 input)
+
+================================================================================
+DESCRIPTION
+================================================================================
+
+In parse_mb_skip(), the SKIP_TYPE_ROW (case 2) and SKIP_TYPE_COL (case 3)
+branches contain insufficient bitstream bounds validation, leading to a heap
+buffer over-read when processing a crafted WMV2 P-frame.
+
+SKIP_TYPE_ROW (lines 337-350):
+
+    case SKIP_TYPE_ROW:
+        for (int mb_y = 0; mb_y < h->c.mb_height; mb_y++) {
+            if (get_bits_left(&h->gb) < 1)       // Only checks for 1 bit
+                return AVERROR_INVALIDDATA;
+            if (get_bits1(&h->gb)) {
+                // entire row skipped — no more bits consumed
+            } else {
+                for (int mb_x = 0; mb_x < h->c.mb_width; mb_x++)
+                    mb_type[...] = (get_bits1(&h->gb) ? ...) | ...;
+                    //              ^^^^^^^^^^^^^^^^^^^^^^^^
+                    //   Reads mb_width bits WITHOUT any get_bits_left check!
+            }
+        }
+
+When the per-row skip flag is 0, the decoder reads mb_width additional bits
+(one per macroblock column) to determine which individual macroblocks are
+skipped. There is no validation that the bitstream contains enough data for
+these reads.
+
+The same flaw exists in SKIP_TYPE_COL (lines 352-365): when the per-column
+skip flag is 0, mb_height bits are consumed without bounds checking.
+
+By contrast, SKIP_TYPE_MPEG (line 330) correctly validates upfront:
+
+    if (get_bits_left(&h->gb) < h->c.mb_height * h->c.mb_width)
+        return AVERROR_INVALIDDATA;
+
+================================================================================
+ROOT CAUSE
+================================================================================
+
+The get_bits_left() check at line 339 (SKIP_TYPE_ROW) and line 354
+(SKIP_TYPE_COL) only ensures 1 bit is available for the row/column flag.
+If the flag is 0 (meaning per-macroblock skip bits follow), mb_width or
+mb_height additional bits are read from the bitstream with no further
+validation.
+
+When the bitstream is truncated (as in a crafted malicious file), the
+get_bits1() calls read beyond the valid bitstream data. FFmpeg provides
+AV_INPUT_BUFFER_PADDING_SIZE (64 bytes = 512 bits) of zero-filled padding,
+but:
+
+  1. For large frame dimensions (mb_width or mb_height > 512), reads exceed
+     even the padding region, accessing adjacent heap objects. This is a
+     direct heap buffer over-read.
+
+  2. Even within the padding region, the garbage/zero values produce
+     incorrect mb_type flags. These incorrect flags propagate into motion
+     compensation (ff_mspel_motion) and block decoding (wmv2_decode_mb),
+     where they can trigger secondary out-of-bounds memory accesses when
+     the decoder processes macroblocks whose skip/non-skip status was
+     determined from invalid data.
+
+================================================================================
+IMPACT
+================================================================================
+
+- Denial of Service: Crash via segfault when reading beyond heap allocation
+- Information Disclosure: Heap data leakage through side channels, as the
+  bits read from heap memory influence decoder state (mb_type flags) which
+  affect observable output (decoded pixel values)
+- The vulnerability is reachable from any application that decodes WMV2
+  (Windows Media Video 8) content, including ffmpeg, ffplay, libavcodec
+  consumers, and any media player or transcoder using FFmpeg libraries
+
+================================================================================
+TRIGGER PATH
+================================================================================
+
+1. Input: A crafted .wmv file (ASF container) with WMV2 codec
+2. The file contains a P-frame (pict_type = 2)
+3. The P-frame's skip_type field is set to SKIP_TYPE_ROW (0b10) or
+   SKIP_TYPE_COL (0b11)
+4. The bitstream is truncated so that after the row/column flag bit,
+   fewer than mb_width (or mb_height) bits remain
+5. The decoder reads beyond the allocated bitstream buffer
+
+Call chain:
+  ff_h263_decode_frame()
+    -> wmv2_decode_picture_header()  [sets pict_type = P]
+    -> ff_wmv2_decode_secondary_picture_header()
+       -> parse_mb_skip()            [VULNERABLE: OOB read here]
+
+================================================================================
+SUGGESTED FIX
+================================================================================
+
+Add get_bits_left validation before the per-macroblock bit reads in both
+SKIP_TYPE_ROW and SKIP_TYPE_COL branches:
+
+--- a/libavcodec/wmv2dec.c
++++ b/libavcodec/wmv2dec.c
+@@ -344,6 +344,8 @@ static int parse_mb_skip(WMV2DecContext *w)
+                     MB_TYPE_SKIP | MB_TYPE_16x16 | MB_TYPE_FORWARD_MV;
+             } else {
++                if (get_bits_left(&h->gb) < h->c.mb_width)
++                    return AVERROR_INVALIDDATA;
+                 for (int mb_x = 0; mb_x < h->c.mb_width; mb_x++)
+                     mb_type[mb_y * h->c.mb_stride + mb_x] =
+                         (get_bits1(&h->gb) ? MB_TYPE_SKIP : 0) | MB_TYPE_16x16 | MB_TYPE_FORWARD_MV;
+@@ -361,6 +363,8 @@ static int parse_mb_skip(WMV2DecContext *w)
+                     MB_TYPE_SKIP | MB_TYPE_16x16 | MB_TYPE_FORWARD_MV;
+             } else {
++                if (get_bits_left(&h->gb) < h->c.mb_height)
++                    return AVERROR_INVALIDDATA;
+                 for (int mb_y = 0; mb_y < h->c.mb_height; mb_y++)
+                     mb_type[mb_y * h->c.mb_stride + mb_x] =
+                         (get_bits1(&h->gb) ? MB_TYPE_SKIP : 0) | MB_TYPE_16x16 | MB_TYPE_FORWARD_MV;

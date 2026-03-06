@@ -1,0 +1,105 @@
+VULNERABILITY: Use-After-Free in JPEG-XS PES Packet Error Path (libavformat/mpegts.c)
+=======================================================================================
+
+Type: Use-After-Free (CWE-416) / Double-Free (CWE-415)
+Severity: HIGH
+Attack Vector: Crafted MPEG-TS input file
+Impact: Potential arbitrary code execution, information disclosure, or crash
+
+SUMMARY
+-------
+A use-after-free vulnerability exists in the MPEG-TS demuxer's JPEG-XS PES
+packet handling. When new_pes_packet() encounters an invalid JPEG-XS header
+(header_size > pkt->size), it returns AVERROR_INVALIDDATA without clearing
+pes->buffer, creating a double-ownership condition between pkt->buf and
+pes->buffer that leads to a use-after-free when the error is handled by the
+caller.
+
+AFFECTED CODE
+-------------
+File: libavformat/mpegts.c
+Function: new_pes_packet() (lines 1016-1071)
+Error path: lines 1033-1047 (JPEG-XS PES payload validation)
+
+DETAILED ANALYSIS
+-----------------
+
+1. In new_pes_packet() (line 1022-1023):
+
+       pkt->buf  = pes->buffer;       // Raw pointer copy (no ref increment)
+       pkt->data = pes->buffer->data;
+       pkt->size = pes->data_index;
+
+   Both pkt->buf and pes->buffer now point to the SAME AVBufferRef.
+
+2. The JPEG-XS validation at lines 1033-1047 checks:
+
+       if (pes->stream_id == 0xbd && pes->stream_type == 0x32 &&
+           pkt->size >= 8 && memcmp(pkt->data + 4, "jxes", 4) == 0)
+       {
+           uint32_t header_size = AV_RB32(pkt->data);
+           if (header_size > pkt->size) {
+               pes->flags |= AV_PKT_FLAG_CORRUPT;
+               return AVERROR_INVALIDDATA;  // <-- EARLY RETURN
+           }
+       }
+
+3. The early return at line 1043 SKIPS the critical cleanup at lines 1062-1063:
+
+       pes->buffer = NULL;              // NOT executed
+       reset_pes_packet_state(pes);     // NOT executed
+
+   This leaves pes->buffer still pointing to the shared AVBufferRef.
+   pes->state remains MPEGTS_PAYLOAD and pes->data_index remains > 0.
+
+4. The error propagates up through:
+   mpegts_push_data() -> handle_packet() -> handle_packets() -> mpegts_read_packet()
+
+5. In mpegts_read_packet() (line 3396), the error path at lines 3404-3418:
+
+       if (ret < 0) {
+           av_packet_unref(ts->pkt);   // FREES the buffer via pkt->buf
+                                        // pes->buffer is now DANGLING
+
+           for (i = 0; i < NB_PID_MAX; i++)
+               if (ts->pids[i] && ts->pids[i]->type == MPEGTS_PES) {
+                   PESContext *pes = ts->pids[i]->u.pes_filter.opaque;
+                   if (pes->state == MPEGTS_PAYLOAD && pes->data_index > 0) {
+                       ret = new_pes_packet(pes, pkt);  // UAF!
+                   }
+               }
+       }
+
+   av_packet_unref(ts->pkt) frees the shared buffer. Then the flush loop
+   finds the same PES context (state is MPEGTS_PAYLOAD, data_index > 0) and
+   calls new_pes_packet() again. Inside that second call:
+
+       pkt->buf  = pes->buffer;              // dangling pointer
+       pkt->data = pes->buffer->data;        // USE-AFTER-FREE READ
+
+   This dereferences the freed AVBufferRef structure.
+
+6. Additionally, if the flush loop doesn't trigger, pes->buffer remains dangling
+   until mpegts_close_filter() is called during cleanup (line 571):
+
+       av_buffer_unref(&pes->buffer);         // DOUBLE-FREE
+
+TRIGGER CONDITIONS
+------------------
+An attacker must craft an MPEG-TS stream with:
+  - A PMT defining a stream with stream_type = 0x32 (STREAM_TYPE_VIDEO_JPEGXS)
+  - PES packets with stream_id = 0xbd (private_stream_1)
+  - PES payload: first 4 bytes = header_size (big-endian), bytes 4-7 = "jxes"
+  - header_size must be > the PES payload length (to trigger the error)
+
+No user interaction beyond opening the file is required.
+
+SUGGESTED FIX
+-------------
+In new_pes_packet(), before the early return at line 1043, add:
+
+       pes->buffer = NULL;
+       reset_pes_packet_state(pes);
+
+Or restructure the JPEG-XS validation to use goto for cleanup rather than
+early return, ensuring pes->buffer ownership is always transferred to pkt.

@@ -1,0 +1,69 @@
+No ASan/UBSan crash was triggered after 5 test attempts (8 PoC variants).
+
+Build: ffmpeg compiled with -fsanitize=address,undefined -fno-omit-frame-pointer -g (aarch64)
+
+Attempts:
+=========
+
+Attempt 1 (v1-v3):
+  v1: Mismatched stsc(100 samples/chunk) vs stsz(5 samples) with edit list
+      Result: No crash. sanity_checks() at line 5164 clips stsc to match stsz/stco.
+      The sample count is capped to min(stts_total, stsz_count) in mov_build_index.
+
+  v2: stts declaring 1M entries but atom only has data for 2
+      Result: No crash. The stts read loop is bounded by atom.size, so only 2 entries
+      are actually read. stts_count is set to the min(declared, atom_size/8) before
+      the loop, but the loop exits at avio_feof. Allocated array is big enough for
+      min_entries, so no OOB write occurs. Uninitialized data in stts entries does
+      not trigger ASan (allocated memory, not freed).
+
+  v3: stsz declaring 100 samples but providing only 5 size entries in atom
+      Result: No crash. The stsz read loop reads from pb and goes past the atom
+      boundary into subsequent atom data, reading 100 values total. The array is
+      allocated for 100 entries (matches sample_count), so no heap overflow on the
+      array itself. The values are garbage but all within bounds.
+
+Attempt 2-3 (v4-v6):
+  v4: Fragmented MP4 with trun entries (pure fragment, no non-fragmented part)
+      Result: No crash. trun processing correctly allocates for entries count.
+      Only H.264 decode errors from null mdat data.
+
+  v5: ctts with INT_MIN (0x80000000) composition offsets
+      Result: No crash. mov_update_dts_shift at line 3593 explicitly handles
+      INT_MIN: "if (duration == INT_MIN) return;" - the exact edge case is caught.
+
+  v6: stsc with sample_description_index=5 but only 1 stsd entry
+      Result: No crash. Bounds check at line 11330-11331 prevents OOB access:
+      "if (id < 0 || id >= sc->stsd_count)" returns AVERROR_INVALIDDATA.
+
+Attempt 4 (v7):
+  v7: HEIF/AVIF file with crafted iloc/iinf/iref/ipma boxes, iref dimg with
+      50 tile references to trigger grid tile_id_list processing
+      Result: "Invalid data found when processing input" - the HEIF parser
+      rejected the file before reaching dangerous code paths. Multiple
+      validation layers (ftyp check, meta box structure, item type validation)
+      prevented exploitation.
+
+Attempt 5 (v8):
+  v8: Track with non-fragmented samples (stts/stsz/stco + ctts) PLUS fragmented
+      moof/trun sections, with SAMPLE_CTS flag. Tests whether trun's memmove
+      at line 5950-5952 overflows when sc->tts_count differs from nb_index_entries.
+      Result: No crash. The ctts_count from mov_read_ctts is a separate field from
+      tts_count used in trun. The trun realloc at line 5930 uses nb_index_entries
+      (correct) and the memmove uses tts_count which is also set correctly.
+
+Conclusion:
+===========
+FFmpeg's MOV/MP4 parser (libavformat/mov.c) is exceptionally well-hardened against
+the vulnerability classes tested. Key defensive measures include:
+- Internal overflow protection in av_malloc_array/av_calloc
+- sanity_checks() cross-validating atom consistency before index building
+- atom.size enforcement in mov_read_default preventing over-reads
+- Explicit bounds checks on array indices (stsd_id, stsc, etc.)
+- Careful handling of signed/unsigned edge cases (INT_MIN in ctts)
+- atom_depth limit of 10 preventing recursion attacks
+
+The most promising vulnerability found is the integer overflow in mov_build_index
+at line 4915 (total += chunk_count * count), but exploitation is prevented by the
+same overflowed value bounding the write loop and by sanity_checks() validating
+atom consistency beforehand.

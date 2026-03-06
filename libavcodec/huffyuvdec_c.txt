@@ -1,0 +1,101 @@
+Vulnerability: Heap Buffer Over-Read via UNCHECKED_BITSTREAM_READER in HuffYUV Decoder
+File: libavcodec/huffyuvdec.c
+Severity: High (CWE-125: Out-of-bounds Read)
+Impact: Information Disclosure / Denial of Service (crash)
+
+=== Root Cause ===
+
+Line 33 of huffyuvdec.c explicitly sets:
+
+    #define UNCHECKED_BITSTREAM_READER 1
+
+This disables ALL bounds checking in the low-level bitstream reading macros
+defined in get_bits.h. Specifically:
+
+1. SKIP_COUNTER (get_bits.h:221) increments the index without clamping to
+   buffer size.
+2. BITS_AVAILABLE (get_bits.h:179) always returns 1 (true).
+3. UPDATE_CACHE (get_bits.h:192-195) performs raw memory reads from
+   (gb)->buffer + (index >> 3) with NO bounds validation.
+
+=== Vulnerable Code Paths ===
+
+1. decode_422_bitstream() [line 671-698]:
+   The function splits into a "slow path" (with BITS_LEFT checks) and a
+   "fast path" (no checks). The guard condition at line 677-678:
+
+       icount = get_bits_left(&s->gb) / (32 * 4);   // = bits_left / 128
+       if (count >= icount) { /* slow path */ }
+       else { /* fast path - NO bounds checks */ }
+
+   The fast path (lines 691-696) assumes 128 bits suffice per iteration.
+   However, each iteration performs TWO READ_2PIX calls, each expanding to
+   GET_VLC_DUAL -> VLC_INTERN with max_depth=3. In the worst case each
+   VLC_INTERN performs 3 table lookups consuming up to VLC_BITS (12) bits
+   each, and GET_VLC_DUAL's fallback path does two VLC_INTERN calls.
+   Thus worst-case per READ_2PIX = 72 bits, and per iteration = 144 bits.
+
+   Since the heuristic allocates only 128 bits per iteration but actual
+   consumption can be up to 144 bits, a crafted stream can enter the fast
+   path and exhaust the bitstream buffer before completing all iterations.
+   The remaining iterations perform UPDATE_CACHE reads beyond the allocated
+   heap buffer (s->bitstream_buffer).
+
+2. decode_plane_bitstream() [line 715-773]:
+   Same pattern — the fast path at lines 725-728 (bps<=8) and 745-748
+   (bps<=14) performs unchecked VLC reads.
+
+3. decode_gray_bitstream() [line 776-794]:
+   Same pattern at lines 788-791.
+
+4. decode_bgr_1() [line 796-852]:
+   The loop condition checks BITS_LEFT > 0 (line 802), but even with just
+   1 bit remaining, VLC_INTERN at max_depth=3 can consume up to 36 bits,
+   and a single loop body can issue up to 4 VLC reads (B,G,R,A channels).
+   All reads beyond the buffer boundary are unchecked due to
+   UNCHECKED_BITSTREAM_READER.
+
+=== Trigger Flow ===
+
+decode_frame() [line 1235]
+  -> av_fast_padded_malloc() allocates s->bitstream_buffer sized to buf_size
+  -> decode_slice() [line 924]
+    -> init_get_bits8() initializes bitstream reader over s->bitstream_buffer
+    -> decode_422_bitstream() / decode_plane_bitstream() / decode_bgr_1()
+       reads beyond s->bitstream_buffer via UPDATE_CACHE macro
+
+The attacker provides a crafted HuffYUV/FFVHuff/HYMT media file where:
+- The frame dimensions (width) dictate a large iteration count
+- The bitstream payload is small (but passes the buf_size >= (w*h+7)/8 check)
+- The Huffman tables are crafted so VLC codes are long (near max_depth=3),
+  maximizing per-iteration bit consumption to exceed the 128-bit heuristic
+
+=== Impact ===
+
+- Information Disclosure: The over-read exposes heap contents that follow
+  s->bitstream_buffer. An attacker processing video on a server (e.g.,
+  transcoding service) could extract sensitive memory contents.
+- Denial of Service: Reading unmapped pages causes a SIGSEGV crash.
+- The vulnerability is reachable from any application using FFmpeg to decode
+  HuffYUV (codec_id HUFFYUV), FFVHuff (FFVHUFF), or HYMT streams, including
+  ffmpeg CLI, ffplay, libavcodec consumers, and browser/media-player
+  integrations.
+
+=== Affected Codecs ===
+
+- ff_huffyuv_decoder  (AV_CODEC_ID_HUFFYUV)
+- ff_ffvhuff_decoder  (AV_CODEC_ID_FFVHUFF)
+- ff_hymt_decoder     (AV_CODEC_ID_HYMT)
+
+=== Suggested Fix ===
+
+Remove or set UNCHECKED_BITSTREAM_READER to 0:
+
+    -#define UNCHECKED_BITSTREAM_READER 1
+    +#define UNCHECKED_BITSTREAM_READER 0
+
+And/or fix the icount heuristic to use the true worst-case bit consumption
+(144 bits per iteration instead of 128):
+
+    -    icount = get_bits_left(&s->gb) / (32 * 4);
+    +    icount = get_bits_left(&s->gb) / (36 * 4);

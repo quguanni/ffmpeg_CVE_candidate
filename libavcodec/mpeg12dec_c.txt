@@ -1,0 +1,94 @@
+Vulnerability: Heap Buffer Over-Read via UNCHECKED_BITSTREAM_READER in MPEG-1/2 Decoder
+
+File: libavcodec/mpeg12dec.c
+Type: CWE-125 (Out-of-bounds Read) / CWE-126 (Buffer Over-read)
+Severity: High
+Impact: Information Disclosure, Denial of Service (crash)
+
+=== Root Cause ===
+
+Line 30 defines:
+    #define UNCHECKED_BITSTREAM_READER 1
+
+This explicitly disables ALL bounds checking in the bitstream reader macros
+(get_bits.h). With this enabled:
+  - OPEN_READER() does not track buffer size (line 177 of get_bits.h)
+  - BITS_AVAILABLE() always returns 1 (line 179 of get_bits.h)
+  - SKIP_COUNTER() does not clamp the index (line 221 of get_bits.h)
+
+The bitstream index can advance arbitrarily far past the buffer end, and
+UPDATE_CACHE reads from `gb->buffer + (index >> 3)` without any boundary
+check.
+
+=== Vulnerable Code Paths ===
+
+1) mpeg2_decode_block_intra() (lines 311-390):
+   Contains a for(;;) loop (line 346) that repeatedly calls UPDATE_CACHE and
+   GET_RL_VLC. The loop only terminates when:
+     - level == 127 (end-of-block VLC code)
+     - i > MAX_INDEX (63)
+   With a crafted bitstream where neither condition is met from garbage data
+   read past the buffer, the loop continues reading heap memory far beyond
+   the AV_INPUT_BUFFER_PADDING_SIZE (64 bytes).
+
+2) mpeg1_decode_block_inter() (lines 142-224):
+   Same loop pattern. The escape code path (lines 182-197) reads 6+8 (or
+   6+8+8) bits per escape iteration. With 64 coefficient slots, the loop
+   can read up to 64 * 22 = 1408 bits (~176 bytes) past the buffer, far
+   exceeding the 64-byte padding.
+
+3) mpeg2_decode_block_non_intra() (lines 226-309):
+   Same vulnerable pattern with unchecked for(;;) loop.
+
+=== Secondary Vulnerability: Pre-bounds-check OOB read in decode_chunks() ===
+
+Lines 2431-2438:
+    if (s2->codec_id != AV_CODEC_ID_MPEG1VIDEO && s2->mb_height > 2800/16)
+        mb_y += (*buf_ptr&0xE0)<<2;    // <-- read BEFORE check
+    ...
+    if (buf_end - buf_ptr < 2) {        // <-- bounds check AFTER
+        return AVERROR_INVALIDDATA;
+    }
+
+For MPEG-2 videos with height > 2800 pixels, `*buf_ptr` is dereferenced
+BEFORE checking whether buf_ptr is within bounds. If a slice start code
+appears at the very end of the input buffer, buf_ptr points past buf_end,
+causing a 1-byte heap over-read.
+
+The same pattern exists in slice_decode_thread() at line 1680:
+    mb_y += (*buf&0xE0)<<2;
+where buf comes from avpriv_find_start_code() and may point to the end of
+the buffer.
+
+=== Attack Scenario ===
+
+An attacker crafts a minimal MPEG-1/2 file with:
+1. Valid sequence header (sets up decoder context)
+2. Valid picture header (I-frame)
+3. A slice with a very small payload (few bytes)
+4. The slice bitstream is crafted so that block decode loops enter the
+   escape-code path repeatedly, causing the unchecked bitstream reader to
+   read hundreds of bytes past the allocated buffer
+
+Each UPDATE_CACHE macro performs:
+    AV_RB64(gb->buffer + (index >> 3))
+This reads 8 bytes at an offset that grows without bounds, accessing
+arbitrary heap memory after the input buffer.
+
+=== Impact ===
+
+- Information Disclosure: Heap contents beyond the buffer are read into the
+  decoder's internal state. Side-channel or error-message leaks may expose
+  sensitive data.
+- Denial of Service: If the over-read hits unmapped memory, the process
+  crashes with SIGSEGV.
+- The vulnerability is triggerable by any application that decodes
+  MPEG-1/2 video using FFmpeg (e.g., ffmpeg CLI, ffplay, libavcodec users).
+
+=== Suggested Fix ===
+
+1. Remove `#define UNCHECKED_BITSTREAM_READER 1` from line 30, or
+2. Add explicit get_bits_left() checks inside the block decode for(;;) loops
+   before each UPDATE_CACHE/GET_RL_VLC call, or
+3. Move the bounds check at line 2438 before the *buf_ptr dereference at
+   line 2432.

@@ -1,0 +1,87 @@
+VULNERABILITY: Integer Overflow in ape_decode_value_3990() Leading to Decoder State Corruption and Denial of Service
+
+FILE: libavcodec/apedec.c
+AFFECTED FUNCTION: ape_decode_value_3990() (line 573-612)
+SECONDARY: decode_array_0000() (lines 649-650)
+CWE: CWE-190 (Integer Overflow or Wraparound)
+SEVERITY: High (Denial of Service via crafted media file)
+
+DESCRIPTION:
+
+In ape_decode_value_3990(), the computation at line 606:
+
+    x = base + overflow * pivot;
+
+suffers from an unsigned integer overflow. The variable `overflow` is attacker-controlled
+and can be any 32-bit value (0 to 0xFFFFFFFF). When the range-decoded overflow symbol
+equals MODEL_ELEMENTS - 1 (63), the code reads a full 32-bit overflow value from the
+bitstream (lines 582-585):
+
+    if (overflow == (MODEL_ELEMENTS - 1)) {
+        overflow  = (unsigned)range_decode_bits(ctx, 16) << 16;
+        overflow |= range_decode_bits(ctx, 16);
+    }
+
+The multiplication `overflow * pivot` wraps around the 32-bit unsigned integer range.
+For example, with overflow = 0x7FFFFFFF and pivot = 2, the product wraps to 0xFFFFFFFE.
+The resulting corrupted `x` is then passed to update_rice(), which uses it to update
+rice->ksum:
+
+    rice->ksum += ((x + 1) / 2) - ((rice->ksum + 16) >> 5);
+
+A single crafted sample with overflow = 0x7FFFFFFF causes ksum to jump by approximately
+2^31 in a single step (since (0xFFFFFFFF + 1) / 2 = 0x7FFFFFFF = 2147483647). This
+massively corrupts the internal rice coding state.
+
+IMPACT:
+
+1. STATE CORRUPTION: After the overflow, rice->ksum is driven to ~2^31, causing
+   pivot = ksum >> 5 to become ~2^26 (67 million). All subsequent decoded values
+   in the frame use this corrupted pivot, producing wildly incorrect sample values.
+
+2. CASCADING DECODER ERRORS: The corrupted x value is converted to a signed sample
+   via ((x >> 1) ^ ((x & 1) - 1)) + 1 (line 611). With x near UINT_MAX, this
+   produces extreme int32_t values (near INT_MIN or INT_MAX) that propagate through
+   the predictor stage (predictor_decode_stereo_3950 or predictor_decode_mono_3950),
+   further amplifying the corruption.
+
+3. DENIAL OF SERVICE: For 24-bit audio (AV_SAMPLE_FMT_S32P), the corrupted decoded
+   values are multiplied by 256U at line 1689 (sample24 = s->decoded[ch][i] * 256U),
+   producing full-range garbage output. Any application relying on valid audio output
+   (media players, transcoding pipelines) will produce audibly corrupted results.
+
+4. The error is NOT caught by existing validation. The ctx->error flag is never set
+   by this code path, so ape_decode_frame() considers the frame valid and returns
+   it to the caller with got_frame_ptr = 1.
+
+SECONDARY VULNERABILITY - decode_array_0000() UB (fileversion < 3860):
+
+At lines 649-650:
+    ksummax = 1 << rice->k + 7;
+    ksummin = rice->k ? (1 << rice->k + 6) : 0;
+
+Due to C operator precedence, these evaluate as `1 << (rice->k + 7)` and
+`1 << (rice->k + 6)`. The function get_k() (line 614-617) can return up to 25
+(when rice->ksum >> 7 is large). With rice->k = 25:
+  - `1 << (25 + 7) = 1 << 32` is UNDEFINED BEHAVIOR (shift >= width of int)
+  - `1 << (25 + 6) = 1 << 31` shifts into the sign bit (UB in C11+)
+
+On x86, `1 << 32` typically evaluates to 1 (shift count masked to 5 bits),
+causing ksummax = 1. This makes the while loop at line 663 (rice->ksum >= ksummax)
+always true, incrementing rice->k until > 24 and returning early. The early return
+skips the signed conversion loop at lines 673-674, leaving raw unsigned values in
+the output buffer.
+
+ROOT CAUSE:
+Missing overflow check on the `overflow * pivot` multiplication in ape_decode_value_3990(),
+and missing bounds validation on `rice->k` initial value in decode_array_0000().
+
+AFFECTED VERSIONS:
+- ape_decode_value_3990: APE files with fileversion >= 3990 (most common modern format)
+- decode_array_0000: APE files with fileversion < 3860
+
+SUGGESTED FIX:
+1. In ape_decode_value_3990(), validate that `overflow * pivot` does not exceed a
+   reasonable bound (e.g., UINT_MAX / pivot) before computing x.
+2. In decode_array_0000(), clamp rice->k to 24 before computing ksummax/ksummin,
+   or use unsigned types with explicit overflow handling.

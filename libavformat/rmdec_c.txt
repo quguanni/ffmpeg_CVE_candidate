@@ -1,0 +1,169 @@
+Vulnerability: Signed Integer Overflow in SIPR Audio Deinterleaver Leading to
+Undefined Behavior and Potential Heap Buffer Out-of-Bounds Write
+
+Severity: HIGH (CVSS ~7.8 - Heap-based OOB write via UB, potential RCE)
+
+File: libavformat/rmsipr.c (triggered from libavformat/rmdec.c)
+Function: ff_rm_reorder_sipr_data() called from ff_rm_parse_packet()
+Lines: rmsipr.c:43, rmdec.c:953-954
+
+==============================================================================
+ROOT CAUSE
+==============================================================================
+
+In ff_rm_reorder_sipr_data() (rmsipr.c:41-61), the nibble block size `bs` is
+computed as:
+
+    int n, bs = sub_packet_h * framesize * 2 / 96;   // line 43
+
+The validation in rm_read_audio_stream_info() (rmdec.c:296-304) only checks:
+
+    ast->audio_framesize * (uint64_t)sub_packet_h > (unsigned)INT_MAX
+
+This permits h * w up to INT_MAX (2147483647). However, the subsequent
+multiplication by 2 in ff_rm_reorder_sipr_data() can overflow a signed 32-bit
+integer when h * w > INT_MAX/2 (1073741823).
+
+For example, with sub_packet_h=46340 and audio_framesize=46340:
+  - h * w = 2147395600 (passes validation: <= INT_MAX)
+  - h * w * 2 = 4294791200 (OVERFLOWS signed int32)
+
+This constitutes UNDEFINED BEHAVIOR per C99/C11 §6.5/5. The compiler is
+permitted to generate ANY code, including code that computes a bogus positive
+value for `bs`, leading to out-of-bounds heap buffer accesses.
+
+==============================================================================
+VULNERABLE CODE PATH
+==============================================================================
+
+1. HEADER PARSING (rmdec.c:123-315):
+
+   rm_read_audio_stream_info() parses the RA audio header:
+
+     ast->sub_packet_h = sub_packet_h = avio_rb16(pb);    // line 179
+     st->codecpar->block_align = avio_rb16(pb);            // line 180
+     ast->sub_packet_size = sub_packet_size = avio_rb16(pb); // line 181
+
+   For SIPR codec (line 234-241):
+
+     ast->audio_framesize = st->codecpar->block_align;     // line 233
+     st->codecpar->block_align = ff_sipr_subpk_size[flavor]; // line 240
+
+   SIPR-specific validation at lines 287-291 is EMPTY (just break):
+
+     case DEINT_ID_SIPR:   // line 287
+     case DEINT_ID_INT0:
+     case DEINT_ID_VBRS:
+     case DEINT_ID_VBRF:
+         break;            // NO SIPR-specific parameter validation!
+
+   The only validation for SIPR is the generic check at lines 296-304:
+
+     if (st->codecpar->block_align <= 0 ||
+         ast->audio_framesize * (uint64_t)sub_packet_h > (unsigned)INT_MAX ||
+         ast->audio_framesize * sub_packet_h < st->codecpar->block_align)
+         return AVERROR_INVALIDDATA;
+     if (av_new_packet(&ast->pkt, ast->audio_framesize * sub_packet_h) < 0)
+         return AVERROR(ENOMEM);
+
+   This allows h * w up to INT_MAX but does NOT validate that h * w * 2
+   (used in ff_rm_reorder_sipr_data) won't overflow.
+
+2. PACKET PARSING (rmdec.c:908-994):
+
+   ff_rm_parse_packet() accumulates h sub-packets via readfull() into the
+   ast->pkt.data buffer (lines 946-948):
+
+     case DEINT_ID_SIPR:
+         readfull(s, pb, ast->pkt.data + y * w, w);
+
+   After all h sub-packets are accumulated (line 951-954):
+
+     if (++(ast->sub_packet_cnt) < h)
+         return -1;
+     if (ast->deint_id == DEINT_ID_SIPR)
+         ff_rm_reorder_sipr_data(ast->pkt.data, h, w);  // OVERFLOW HERE
+
+3. SIPR REORDER (rmsipr.c:41-61):
+
+   void ff_rm_reorder_sipr_data(uint8_t *buf, int sub_packet_h, int framesize)
+   {
+       int n, bs = sub_packet_h * framesize * 2 / 96;  // INTEGER OVERFLOW
+
+       for (n = 0; n < 38; n++) {
+           int i = bs * sipr_swaps[n][0];   // OOB index if bs is bogus
+           int o = bs * sipr_swaps[n][1];   // OOB index if bs is bogus
+
+           for (j = 0; j < bs; j++, i++, o++) {
+               // READ at buf[i >> 1] and buf[o >> 1]  -- potential OOB
+               // WRITE to buf[o >> 1] and buf[i >> 1]  -- potential OOB
+           }
+       }
+   }
+
+   The sipr_swaps table contains indices up to 95. Maximum nibble index
+   accessed = bs * 95 + bs - 1 = 96*bs - 1. Maximum byte index = (96*bs-1)/2.
+
+   If the compiler computes bs as a large positive value (which it may do
+   under UB), the byte indices bs*95/2 can far exceed the buffer size h*w,
+   resulting in heap buffer over-read AND over-write.
+
+==============================================================================
+EXPLOITATION
+==============================================================================
+
+An attacker crafts an RM file with:
+  - SIPR audio codec (codec_id = AV_CODEC_ID_SIPR, flavor 0-3)
+  - deint_id = DEINT_ID_SIPR ('sipr')
+  - sub_packet_h (h) and audio_framesize (w) such that:
+    * h * w <= INT_MAX (passes validation)
+    * h * w > INT_MAX/2 (causes overflow in h * w * 2)
+  - Example: h = 46340, w = 46340 → h*w = 2147395600
+
+The overflow in bs = h * w * 2 / 96 is undefined behavior. Depending on
+compiler, optimization level, and platform:
+
+  a) With typical two's complement (GCC -O0): bs becomes negative, loop
+     skipped. No immediate crash but SIPR audio is silently corrupted.
+
+  b) With aggressive optimization (GCC -O2/-O3 with LTO): The compiler may
+     assume h * w * 2 doesn't overflow (since UB doesn't happen in valid
+     programs), and may generate code that computes the "mathematically
+     correct" value for bs. On x86-64 with 64-bit intermediate registers,
+     this could produce bs = h*w*2/96 = ~44 million, causing accesses to
+     buf[~2 billion] — far beyond the allocated buffer.
+
+  c) The heap overflow writes attacker-influenced nibble data (from the
+     deinterleaved audio packets) at controlled offsets relative to the
+     buffer, enabling heap metadata corruption and potential code execution.
+
+==============================================================================
+IMPACT
+==============================================================================
+
+- Heap buffer out-of-bounds read and write (compiler-dependent)
+- Denial of service (crash)
+- Potential remote code execution via heap corruption
+- Triggered by opening a crafted .rm or .ra file (no user interaction needed
+  beyond opening the file)
+- Affects all FFmpeg builds with RM demuxer enabled (default configuration)
+
+==============================================================================
+SUGGESTED FIX
+==============================================================================
+
+Add a check in rm_read_audio_stream_info() for SIPR to ensure h * w * 2 does
+not overflow, or change the computation in ff_rm_reorder_sipr_data() to use
+64-bit arithmetic:
+
+Option A (preferred — fix in rmsipr.c):
+
+  -  int n, bs = sub_packet_h * framesize * 2 / 96;
+  +  int n, bs = (int)((int64_t)sub_packet_h * framesize * 2 / 96);
+
+Option B (validation in rmdec.c, add after line 291):
+
+     case DEINT_ID_SIPR:
+  +      if (ast->audio_framesize * (uint64_t)sub_packet_h > INT_MAX / 2)
+  +          return AVERROR_INVALIDDATA;
+         break;

@@ -1,0 +1,121 @@
+Vulnerability: Integer Overflow in probe_codec() leading to Heap Buffer Overflow
+File: libavformat/demux.c
+Severity: HIGH (Heap Buffer Overflow — potential Remote Code Execution)
+Affected Lines: 436, 444-445
+
+================================================================================
+SUMMARY
+================================================================================
+
+In the probe_codec() function (line 424), when accumulating packet data into the
+probe buffer for codec detection, the allocation size computation at line 436
+uses signed int arithmetic that can overflow, causing a too-small buffer to be
+allocated. The subsequent memcpy at line 444 then writes pkt->size bytes into
+this undersized buffer, resulting in a heap buffer overflow.
+
+================================================================================
+VULNERABLE CODE
+================================================================================
+
+static int probe_codec(AVFormatContext *s, AVStream *st, const AVPacket *pkt)
+{
+    ...
+    if (sti->request_probe > 0) {
+        AVProbeData *const pd = &sti->probe_data;
+        int end;
+        ...
+        --sti->probe_packets;
+
+        if (pkt) {
+            // LINE 436: Integer overflow in size calculation
+            uint8_t *new_buf = av_realloc(pd->buf, pd->buf_size+pkt->size+AVPROBE_PADDING_SIZE);
+            if (!new_buf) {
+                ...
+                goto no_packet;
+            }
+            pd->buf = new_buf;
+            // LINE 444: memcpy uses original pkt->size — heap buffer overflow
+            memcpy(pd->buf + pd->buf_size, pkt->data, pkt->size);
+            // LINE 445: Tracked size also overflows
+            pd->buf_size += pkt->size;
+            memset(pd->buf + pd->buf_size, 0, AVPROBE_PADDING_SIZE);
+        }
+        ...
+
+================================================================================
+ROOT CAUSE ANALYSIS
+================================================================================
+
+1. pd->buf_size is declared as `int` (from AVProbeData struct in avformat.h).
+2. pkt->size is declared as `int` (from AVPacket struct).
+3. AVPROBE_PADDING_SIZE is 32.
+
+The expression at line 436:
+    pd->buf_size + pkt->size + AVPROBE_PADDING_SIZE
+
+is computed entirely in signed `int` arithmetic. If the accumulated pd->buf_size
+plus the current pkt->size exceeds INT_MAX (2,147,483,647), signed integer
+overflow occurs (undefined behavior in C).
+
+On 32-bit systems (where sizeof(int) == sizeof(size_t) == 4):
+  - The overflowed int value is passed directly as the size_t argument to
+    av_realloc(). If the overflow wraps to a small positive value, av_realloc()
+    allocates a tiny buffer.
+  - The subsequent memcpy(pd->buf + pd->buf_size, pkt->data, pkt->size) writes
+    pkt->size bytes at offset pd->buf_size from the start of this tiny buffer,
+    causing a massive heap buffer overflow.
+
+On 64-bit systems:
+  - The negative int result is sign-extended to a very large size_t value,
+    causing the allocation to fail (realloc returns NULL). This triggers the
+    goto no_packet path, which is safe.
+  - HOWEVER: the pd->buf_size += pkt->size accumulation at line 445 can itself
+    overflow on prior iterations without being detected. Once pd->buf_size wraps
+    to a small or negative value, a subsequent call with a normal-sized packet
+    can produce a small allocation size that succeeds, leading to the same
+    heap overflow on 64-bit as well.
+
+================================================================================
+EXPLOITABILITY
+================================================================================
+
+Triggering conditions:
+  - The stream must have request_probe > 0 (codec probing is active).
+  - The probesize (s->probesize) must be set large enough to allow accumulation
+    of data beyond INT_MAX, OR the attacker must craft packets such that
+    pd->buf_size wraps via repeated small overflows at line 445.
+  - s->max_probe_packets (default 2500) limits the number of iterations, so
+    each packet must be sufficiently large (~860KB per packet to reach 2GB in
+    2500 packets).
+
+Impact:
+  - Heap buffer overflow can overwrite adjacent heap metadata and objects.
+  - On 32-bit targets (embedded systems, IoT devices, some Android builds),
+    this is directly exploitable for arbitrary code execution.
+  - On 64-bit targets, exploitation requires the pd->buf_size accumulator to
+    wrap first (multi-step overflow), but is still feasible.
+  - At minimum, this causes a denial-of-service crash.
+
+Attack vector:
+  - A crafted media file with a stream requiring codec probing and containing
+    many large packets can trigger the overflow during avformat_find_stream_info()
+    or av_read_frame().
+
+================================================================================
+SUGGESTED FIX
+================================================================================
+
+Use size_t for the allocation size computation and add an overflow check:
+
+    if (pkt) {
+-       uint8_t *new_buf = av_realloc(pd->buf, pd->buf_size+pkt->size+AVPROBE_PADDING_SIZE);
++       size_t new_size = (size_t)pd->buf_size + pkt->size + AVPROBE_PADDING_SIZE;
++       if (new_size > INT_MAX) {
++           av_log(s, AV_LOG_WARNING,
++                  "Probe buffer for stream %d too large\n", st->index);
++           goto no_packet;
++       }
++       uint8_t *new_buf = av_realloc(pd->buf, new_size);
+
+Additionally, pd->buf_size should be changed to size_t in AVProbeData, or at
+minimum the += at line 445 should be checked for overflow.
